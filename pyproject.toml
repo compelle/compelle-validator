@@ -1,0 +1,29 @@
+[project]
+name = "compelle-validator"
+version = "0.1.0"
+description = "Reference validator for the Compelle subnet (Bittensor SN82)"
+requires-python = ">=3.12"
+dependencies = [
+    "bittensor>=10.1,<11",
+    "openai>=2.26,<3",
+    "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+compelle-validator = "compelle.validator:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.setuptools.packages.find]
+include = ["compelle*"]
+
+[tool.setuptools.package-data]
+compelle = ["config.json"]
