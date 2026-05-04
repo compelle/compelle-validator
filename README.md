@@ -93,6 +93,33 @@ Per-deployment values come from environment variables and override the file:
 | `CHUTES_BASE_URL` | Override for the Chutes API base URL |
 | `COMPELLE_PUSH_URL` | Override the public aggregation endpoint (set to empty to disable) |
 
+## Upgrading
+
+### Manual (default)
+
+When a release is announced, run:
+
+```bash
+sudo /opt/compelle-validator/deploy/upgrade.sh
+```
+
+The script fetches `origin/main`, shows the diff (commit hash + message), asks for confirmation, then `git reset --hard` + restart. Pin a specific tag instead with `upgrade.sh v1.2.3`.
+
+### Watchtower (opt-in auto-update)
+
+Auto-pull `origin/main` every 10 minutes and restart on change:
+
+```bash
+sudo systemctl enable --now compelle-watchtower.timer
+```
+
+Risks (operator must accept):
+- We push a bad commit → all watchtower-enabled validators crash together
+- We push a malicious commit (compromised github account) → validators run it
+- Mitigation: keep an eye on `journalctl -u compelle-watchtower` after announcements
+
+To disable: `sudo systemctl disable --now compelle-watchtower.timer`.
+
 ## License
 
 MIT. See `LICENSE`.
