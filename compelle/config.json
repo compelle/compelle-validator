@@ -22,7 +22,7 @@
     },
     "tournament": {
       "epoch_seconds": 600,
-      "max_concurrent_games": 5
+      "max_concurrent_games": 10
     },
     "elo": {
       "k_factor": 32.0,
