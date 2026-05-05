@@ -260,9 +260,12 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None):
     # ONE topic per tournament — fairer Elo signal because every miner is tested
     # under identical conditions. Topic index is chain-derived so all validators
     # converge: tempo_index = epoch_start_block // tempo. Wraps around when we
-    # exceed the topic-list length. After the daily 08:00 UTC topic-refresh the
+    # exceed the topic-list length. After the 00/06/12/18 UTC topic-refresh the
     # gist content changes; validators briefly diverge but realign within an epoch.
-    topics = config["topics"]
+    topics = config.get("topics") or []
+    if not topics:
+        log.warning("no topics in config; skipping tournament")
+        return [], elo
     tempo = config.get("tempo_blocks", 360)
     topic_index = (epoch_start_block // tempo) % len(topics)
     chosen_topic = topics[topic_index]
