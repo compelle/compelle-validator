@@ -222,15 +222,67 @@ def push_pending(push_url: str, wallet) -> None:
         log.warning(f"pushed.json save failed: {e}")
 
 
+ELO_STATE_PATH = f"{DATA_DIR}/elo_state.json"
+LAST_TEMPO_PATH = f"{DATA_DIR}/last_completed_tempo.txt"
+
+
+def save_elo(elo) -> None:
+    """Persist Elo ratings so a restart resumes from last state."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = ELO_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"k": elo.k, "initial": elo.initial, "ratings": elo.ratings}, f)
+        os.replace(tmp, ELO_STATE_PATH)
+    except Exception as e:
+        log.warning(f"elo save failed: {e}")
+
+
+def load_elo(default_k: float, default_initial: float):
+    """Load persisted Elo ratings; if missing/corrupt, return fresh."""
+    try:
+        with open(ELO_STATE_PATH) as f:
+            d = json.load(f)
+        e = Elo(k=d.get("k", default_k), initial=d.get("initial", default_initial))
+        e.ratings = dict(d.get("ratings", {}))
+        log.info(f"loaded persisted Elo: {len(e.ratings)} hotkeys")
+        return e
+    except FileNotFoundError:
+        return Elo(k=default_k, initial=default_initial)
+    except Exception as e:
+        log.warning(f"elo load failed ({e}); starting fresh")
+        return Elo(k=default_k, initial=default_initial)
+
+
+def get_last_tempo() -> int:
+    """Return the highest tempo_index already processed, or -1 if never."""
+    try:
+        with open(LAST_TEMPO_PATH) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return -1
+
+
+def set_last_tempo(tempo_index: int) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = LAST_TEMPO_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(tempo_index))
+        os.replace(tmp, LAST_TEMPO_PATH)
+    except Exception as e:
+        log.warning(f"last_tempo save failed: {e}")
+
+
 def main():
     cfg = load_config()
     api_key = os.environ["CHUTES_API_KEY"]
     wallet = bt.Wallet(name=cfg["wallet_name"], hotkey=cfg["hotkey"])
     netuid = cfg["netuid"]
     llm = LLM(cfg["chutes_api_url"], api_key)
-    elo = Elo(
-        k=cfg["old_config"]["elo"]["k_factor"],
-        initial=cfg["old_config"]["elo"]["initial_rating"],
+    elo = load_elo(
+        default_k=cfg["old_config"]["elo"]["k_factor"],
+        default_initial=cfg["old_config"]["elo"]["initial_rating"],
     )
 
     from compelle import FULL_VERSION
@@ -289,9 +341,20 @@ def main():
         n_zero = sum(1 for r in records.values() if not r.is_eligible)
         log.info(f"miners: {n_real} real, {n_eps} epsilon, {n_zero} ineligible")
 
+        # Idempotency: skip the tournament if we already completed THIS tempo.
+        # Prevents double-applying Elo if the validator restarts mid-tempo.
+        # Topic-index uses the same tempo computation as engine.run_tournament.
+        tempo_blocks = cfg.get("tempo_blocks", 360)
+        current_tempo = epoch_start_block // tempo_blocks
+        last_tempo = get_last_tempo()
+
         results = []
         real_weights: dict[str, float] = {}
-        if n_real >= 2:
+        if current_tempo <= last_tempo:
+            log.info(f"tempo {current_tempo} already processed (last={last_tempo}); "
+                     f"skipping tournament, reusing existing Elo for weights")
+            real_weights = elo.weights(cfg["elo"]["temperature"]) if elo.ratings else {}
+        elif n_real >= 2:
             ok, err = llm.ping(cfg["game"]["model"])
             if not ok:
                 log.warning(f"LLM preflight failed: {err[:200]}")
@@ -300,6 +363,8 @@ def main():
                                               epoch_start_block, elo=elo)
                 if results:
                     real_weights = elo.weights(cfg["elo"]["temperature"])
+                    save_elo(elo)
+                    set_last_tempo(current_tempo)
 
         real_weights = {hk: w for hk, w in real_weights.items()
                         if hk in records and records[hk].is_real}
