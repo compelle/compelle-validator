@@ -21,7 +21,7 @@
       "allow_draws": false
     },
     "tournament": {
-      "epoch_seconds": 600,
+      "epoch_seconds": 4320,
       "max_concurrent_games": 10
     },
     "elo": {

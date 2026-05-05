@@ -120,10 +120,21 @@ def set_weights(sub, wallet, netuid, uids, vals) -> bool:
 def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, elo,
                 set_weights_status):
     os.makedirs(DATA_DIR, exist_ok=True)
+    from compelle import FULL_VERSION
+    # All games in a tournament share one topic now, so surface it at the top.
+    tournament_topic = None
+    if results:
+        first = results[0][2]
+        tournament_topic = {
+            "id": getattr(first, "topic_id", ""),
+            "motion": first.topic,
+        }
     payload = {
         "epoch": epoch,
         "epoch_block": epoch_block,
         "config_revision": topics_revision,
+        "validator_version": FULL_VERSION,
+        "tournament_topic": tournament_topic,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "set_weights_status": set_weights_status,
         "miners": {
@@ -222,7 +233,8 @@ def main():
         initial=cfg["old_config"]["elo"]["initial_rating"],
     )
 
-    log.info(f"compelle validator starting on netuid {netuid} ({cfg['network']})")
+    from compelle import FULL_VERSION
+    log.info(f"compelle validator {FULL_VERSION} starting on netuid {netuid} ({cfg['network']})")
     gist_id = cfg.get("config_gist_id", "")
     gist_owner = cfg.get("config_gist_owner", "")
     keep_epochs = int(cfg.get("keep_epochs", 1000))

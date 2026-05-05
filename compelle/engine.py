@@ -4,9 +4,10 @@ import time
 import random
 import logging
 import itertools
+import hashlib
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 from openai import OpenAI
@@ -14,6 +15,14 @@ from openai import OpenAI
 log = logging.getLogger(__name__)
 
 MAX_STRATEGY_BYTES = 65536
+
+
+def topic_id(topic_obj: dict) -> str:
+    """Stable, content-addressed ID for a topic. Hash of normalized motion text.
+    Same motion text across days/gist-revisions yields the same id, so analytics
+    can group games by topic without string-matching the motion."""
+    motion = (topic_obj.get("motion") or "").strip()
+    return hashlib.sha256(motion.encode("utf-8")).hexdigest()[:12]
 
 _NOT_FOUND_MARKERS = ("404", "no_such_model", "model_not_found", "model not found",
                       "model does not exist", "unknown model")
@@ -95,6 +104,7 @@ class GameResult:
     judge_explanation: str = ""
     completed_at: str = ""
     topic_data: dict | None = None
+    topic_id: str = ""
 
 
 def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
@@ -132,9 +142,11 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
     transcript: list = []
     start = time.time()
 
+    tid = topic_id(topic_obj)
+
     def _mk(winner, reason):
         return GameResult(motion, winner, reason, len(transcript), transcript,
-                          time.time() - start, topic_data=topic_obj)
+                          time.time() - start, topic_data=topic_obj, topic_id=tid)
 
     for _ in range(cfg["max_turns"]):
         for side in ("Pro", "Con"):
@@ -166,6 +178,7 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     fallbacks = cfg.get("judge_model_fallbacks", cfg.get("model_fallbacks", []))
     tags = config.get("thinking_tags") or ["think"]
 
+    tid = topic_id(topic_obj)
     for attempt in range(3):
         try:
             verdict = _chat(
@@ -179,7 +192,7 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
             if attempt == 2:
                 return GameResult(motion, "draw", f"Judge error: {e}",
                                   len(transcript), transcript, duration,
-                                  topic_data=topic_obj)
+                                  topic_data=topic_obj, topic_id=tid)
             continue
 
         clean = strip_thinking(verdict, tags) or verdict.strip()
@@ -191,11 +204,11 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
         if winner:
             return GameResult(motion, winner, "Judge decision",
                               len(transcript), transcript, duration,
-                              " ".join(lines[1:]), topic_data=topic_obj)
+                              " ".join(lines[1:]), topic_data=topic_obj, topic_id=tid)
 
     return GameResult(motion, "draw", "Judge indecisive",
                       len(transcript), transcript, duration,
-                      topic_data=topic_obj)
+                      topic_data=topic_obj, topic_id=tid)
 
 
 class Elo:
@@ -244,8 +257,18 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None):
     matchups = [m for a, b in itertools.combinations(hotkeys, 2) for m in ((a, b), (b, a))]
     rng.shuffle(matchups)
 
+    # ONE topic per tournament — fairer Elo signal because every miner is tested
+    # under identical conditions. Topic index is chain-derived so all validators
+    # converge: tempo_index = epoch_start_block // tempo. Wraps around when we
+    # exceed the topic-list length. After the daily 08:00 UTC topic-refresh the
+    # gist content changes; validators briefly diverge but realign within an epoch.
     topics = config["topics"]
-    games = list(enumerate((pair, rng.choice(topics)) for pair in matchups))
+    tempo = config.get("tempo_blocks", 360)
+    topic_index = (epoch_start_block // tempo) % len(topics)
+    chosen_topic = topics[topic_index]
+    log.info(f"tournament topic: index={topic_index}/{len(topics)} "
+             f"id={topic_id(chosen_topic)} motion={chosen_topic.get('motion','')[:80]!r}")
+    games = list(enumerate((pair, chosen_topic) for pair in matchups))
     workers = config["tournament"].get("max_concurrent_games", 5)
 
     def _play(item):
