@@ -24,6 +24,9 @@ log = logging.getLogger("compelle.validator")
 # `COMPELLE_DATA_DIR=` with no value) doesn't silently resolve to "" and write
 # state files to the filesystem root.
 DATA_DIR = os.environ.get("COMPELLE_DATA_DIR") or "data"
+# Canonical R2 ingest endpoint. Used as the fallback when neither
+# COMPELLE_PUSH_URL nor config.json's push_url is set to a non-empty value.
+DEFAULT_PUSH_URL = "https://compelle-ingest.compelle.workers.dev/ingest"
 # 2hr default: with Chutes timeout=120s and up to 11 LLM calls per game, a
 # slow-Chutes tournament can plausibly run >30 min even at 10 miners. Tournament
 # work doesn't pulse the heartbeat, so a tight watchdog false-fires mid-game.
@@ -41,7 +44,14 @@ def load_config() -> dict:
     cfg["chutes_api_url"] = os.environ.get(
         "CHUTES_BASE_URL", cfg.get("chutes_api_url", "https://llm.chutes.ai/v1")
     )
-    cfg["push_url"] = os.environ.get("COMPELLE_PUSH_URL", cfg.get("push_url", ""))
+    # Push URL precedence: non-empty env > non-empty config > hardcoded default.
+    # An empty env var no longer disables uploading — that was a footgun where
+    # operators using a clean .env file would silently stop contributing
+    # transcripts to the public archive. To explicitly opt out, set
+    # COMPELLE_PUSH_URL=disabled (or set push_url to "disabled" in config.json).
+    env_push = os.environ.get("COMPELLE_PUSH_URL")
+    cfg_push = cfg.get("push_url")
+    cfg["push_url"] = (env_push or cfg_push or DEFAULT_PUSH_URL).strip()
     return cfg
 
 
@@ -237,7 +247,7 @@ def _block_from_filename(name: str) -> int | None:
 
 
 def push_pending(push_url: str, wallet) -> None:
-    if not push_url:
+    if not push_url or push_url.lower() in ("disabled", "off", "none"):
         return
     on_disk = {}
     for path in sorted(glob.glob(f"{DATA_DIR}/epoch_*.json.gz")):

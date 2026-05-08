@@ -91,7 +91,7 @@ Per-deployment values come from environment variables and override the file:
 | `BT_NETUID` | Subnet netuid (defaults to 82) |
 | `BT_NETWORK` | `finney` (default) or a custom endpoint |
 | `CHUTES_BASE_URL` | Override for the Chutes API base URL |
-| `COMPELLE_PUSH_URL` | Override the public aggregation endpoint (set to empty to disable) |
+| `COMPELLE_PUSH_URL` | Override the public aggregation endpoint. Empty / unset = use default. To opt out, set to `disabled`. |
 
 ## Upgrading
 
