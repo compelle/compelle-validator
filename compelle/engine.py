@@ -449,6 +449,96 @@ class Elo:
         return {k: v / total for k, v in e.items()}
 
 
+def _stable_coin_flip(a: str, b: str, tempo_index: int, round_num: int) -> int:
+    """Deterministic 0/1 from (sorted pair, tempo, round). Stable across
+    processes (no PYTHONHASHSEED dependency) and across validators (no
+    shared rng-stream state). round_num in the key means a pair that meets
+    again in a later round gets the opposite assignment."""
+    key = f"{min(a,b)}|{max(a,b)}|t{tempo_index}|r{round_num}".encode()
+    return hashlib.sha256(key).digest()[0] & 1
+
+
+def _swiss_pair_round(hotkeys, scores, color_diff, played, elo, round_num,
+                       tempo_index):
+    """Generate pairings for one Swiss round. Returns list of (pro, con).
+
+    Round 1 uses standard Swiss seeding: top-half-by-Elo plays bottom-half.
+    Round 2+: pair within score groups (highest score first), preferring
+    opponents not yet played; assign Pro to the player with the lower
+    color_diff so per-player Pro/Con balance trends to zero across the
+    tournament. Ties (equal CD, equal Elo) resolved by a content-addressed
+    coin flip so all validators converge on the same pairings without
+    depending on shared rng-stream state (which would desync across
+    validators when one tiebreak fires for some validators but not others).
+    """
+    from collections import defaultdict
+
+    if round_num == 1:
+        sorted_hk = sorted(hotkeys, key=lambda h: (-elo.get(h), h))
+        n = len(sorted_hk)
+        half = n // 2
+        top = sorted_hk[:half]
+        bot = sorted_hk[half:half * 2]
+        # Top half plays Pro; later rounds will flip them via color_diff.
+        # Odd miner (sorted_hk[2*half:]) sits out this round (a "bye").
+        if n % 2 == 1:
+            log.info(f"swiss R1 bye: UID-like-hotkey {sorted_hk[-1][:8]}… "
+                     f"(odd miner count N={n})")
+        return [(top[i], bot[i]) for i in range(half)]
+
+    # Score group keys are floats (0.0 / 0.5 / 1.0 / 1.5 / …). IEEE 754 sums
+    # of half-integers are exact, so equality across validators is safe.
+    groups = defaultdict(list)
+    for hk in hotkeys:
+        groups[scores[hk]].append(hk)
+
+    pairs = []
+    floaters = []  # players who couldn't be paired in their score group
+    for score_val in sorted(groups.keys(), reverse=True):
+        bucket = list(groups[score_val]) + floaters
+        bucket.sort(key=lambda h: (-elo.get(h), h))
+        floaters = []
+        while len(bucket) >= 2:
+            top_player = bucket.pop(0)
+            opp_idx = None
+            for i, candidate in enumerate(bucket):
+                if candidate not in played[top_player]:
+                    opp_idx = i
+                    break
+            if opp_idx is None:
+                # All same-score peers have been played; carry to next group.
+                floaters.append(top_player)
+                continue
+            opp = bucket.pop(opp_idx)
+            cd_top, cd_opp = color_diff[top_player], color_diff[opp]
+            if cd_top < cd_opp:
+                pro, con = top_player, opp
+            elif cd_top > cd_opp:
+                pro, con = opp, top_player
+            else:
+                # Equal color preference: stable coin flip from sorted pair.
+                if _stable_coin_flip(top_player, opp, tempo_index, round_num):
+                    pro, con = top_player, opp
+                else:
+                    pro, con = opp, top_player
+            pairs.append((pro, con))
+        floaters.extend(bucket)
+
+    # Last-resort: pair leftover floaters even if rematch. Rare path,
+    # logged so vtrust regressions are easy to root-cause.
+    if floaters:
+        log.info(f"swiss R{round_num} floater fallback: {len(floaters)} "
+                 f"players, rematches allowed")
+    floaters.sort(key=lambda h: (-elo.get(h), h))
+    while len(floaters) >= 2:
+        a, b = floaters.pop(0), floaters.pop(0)
+        if color_diff[a] <= color_diff[b]:
+            pairs.append((a, b))
+        else:
+            pairs.append((b, a))
+    return pairs
+
+
 def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
                    on_progress=None):
     hotkeys = list(strategies.keys())
@@ -463,19 +553,16 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
 
     # Seed off the tempo bucket, NOT the sampled epoch_start_block. Validators
     # that observe the chain at slightly different blocks within the same tempo
-    # would otherwise produce different matchup orderings (and thus different
-    # Elo paths). Topic selection already uses the tempo bucket below.
+    # would otherwise produce different orderings (and thus different Elo
+    # paths). Topic selection uses the same bucket so all validators converge.
     tempo = config.get("tempo_blocks", 360)
     tempo_index = epoch_start_block // tempo
-    rng = random.Random(tempo_index)
-    matchups = [m for a, b in itertools.combinations(hotkeys, 2) for m in ((a, b), (b, a))]
-    rng.shuffle(matchups)
 
-    # ONE topic per tournament — fairer Elo signal because every miner is tested
-    # under identical conditions. Topic index is chain-derived so all validators
-    # converge: tempo_index = epoch_start_block // tempo. Wraps around when we
-    # exceed the topic-list length. After the 00/06/12/18 UTC topic-refresh the
-    # gist content changes; validators briefly diverge but realign within an epoch.
+    # ONE topic per tournament — fairer Elo signal because every miner is
+    # tested under identical conditions. Topic index is chain-derived. Wraps
+    # when exceeding the topic list. After 00/06/12/18 UTC topic-refresh the
+    # gist content changes; validators briefly diverge but realign within an
+    # epoch.
     topics = config.get("topics") or []
     if not topics:
         log.warning("no topics in config; skipping tournament")
@@ -484,47 +571,83 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
     chosen_topic = topics[topic_index]
     log.info(f"tournament topic: index={topic_index}/{len(topics)} "
              f"id={topic_id(chosen_topic)} motion={chosen_topic.get('motion','')[:80]!r}")
-    games = list(enumerate((pair, chosen_topic) for pair in matchups))
+
+    # Swiss tournament: N rounds, score-based pairing, per-player color balance.
+    # Drops compute from O(N²) round-robin (90 games for 10 miners) to a small
+    # multiple of N (20 games for 10 miners at 4 rounds) while preserving
+    # per-player Pro/Con balance.
+    num_rounds = config["tournament"].get("swiss_rounds", 4)
     workers = config["tournament"].get("max_concurrent_games", 5)
+    log.info(f"swiss tournament: {len(hotkeys)} miners × {num_rounds} rounds")
 
-    def _play(item):
-        idx, ((pro, con), topic) = item
-        result = play_game(llm, config, topic, strategies[pro], strategies[con])
-        result.completed_at = datetime.now(timezone.utc).isoformat()
-        return idx, pro, con, result
+    scores = {hk: 0.0 for hk in hotkeys}
+    color_diff = {hk: 0 for hk in hotkeys}  # (# games as Pro) − (# games as Con)
+    played = {hk: set() for hk in hotkeys}
+    all_results = []
 
-    completed: list[tuple[int, str, str, GameResult]] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for fut in as_completed({pool.submit(_play, g): g for g in games}):
-            try:
-                completed.append(fut.result())
-            except Exception as e:
-                log.error(f"game error: {e}")
-            # Pulse the watchdog after each game (success or failure). Without
-            # this, large tournaments can exceed the watchdog timeout even
-            # while making steady progress, causing systemd to kill+restart
-            # mid-tournament and lose all completed games.
-            if on_progress is not None:
+    for round_num in range(1, num_rounds + 1):
+        pairs = _swiss_pair_round(hotkeys, scores, color_diff, played,
+                                  elo, round_num, tempo_index)
+        for (pro, con) in pairs:
+            log.info(f"swiss R{round_num} pair: pro={pro[:8]}… "
+                     f"con={con[:8]}… pro_cd={color_diff[pro]:+d} "
+                     f"con_cd={color_diff[con]:+d} pro_elo={elo.get(pro):.1f} "
+                     f"con_elo={elo.get(con):.1f}")
+        log.info(f"swiss R{round_num}/{num_rounds}: {len(pairs)} games")
+        games = list(enumerate((pair, chosen_topic) for pair in pairs))
+
+        def _play(item):
+            idx, ((pro, con), topic) = item
+            result = play_game(llm, config, topic, strategies[pro], strategies[con])
+            result.completed_at = datetime.now(timezone.utc).isoformat()
+            return idx, pro, con, result
+
+        completed: list[tuple[int, str, str, GameResult]] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for fut in as_completed({pool.submit(_play, g): g for g in games}):
                 try:
-                    on_progress()
+                    completed.append(fut.result())
                 except Exception as e:
-                    log.warning(f"on_progress callback failed: {e}")
+                    log.error(f"game error: {e}")
+                # Pulse the watchdog after each game (success or failure).
+                # Without this, large tournaments can exceed the watchdog
+                # timeout even while making steady progress, causing systemd
+                # to kill+restart mid-tournament and lose completed games.
+                if on_progress is not None:
+                    try:
+                        on_progress()
+                    except Exception as e:
+                        log.warning(f"on_progress callback failed: {e}")
 
-    completed.sort(key=lambda x: x[0])
-    results = []
-    for _, pro, con, result in completed:
-        reason = (result.reason or "").lower()
-        # `in` instead of `startswith` so the panel-fallback path's prefixed
-        # form ("Panel-insufficient → Judge error: ...") is also recognized
-        # as an infrastructure failure that should NOT update Elo.
-        if "llm error" in reason or "judge error" in reason:
-            pass
-        elif result.winner == "Pro":
-            elo.update(pro, con)
-        elif result.winner == "Con":
-            elo.update(con, pro)
-        else:
-            elo.update_draw(pro, con, elo_cfg.get("draw_penalty", 0))
-        results.append((pro, con, result))
+        completed.sort(key=lambda x: x[0])
+        for _, pro, con, result in completed:
+            reason = (result.reason or "").lower()
+            # `in` instead of `startswith` so the panel-fallback path's
+            # prefixed form ("Panel-insufficient → Judge error: ...") is
+            # also recognized as an infrastructure failure.
+            errored = "llm error" in reason or "judge error" in reason
+            if errored:
+                # Don't burn the matchup slot on infra failure: the same pair
+                # may succeed in a later round when Chutes recovers. Without
+                # this, a sustained Chutes outage causes every round to mark
+                # all pairs as played, forcing later rounds into the floater
+                # rematch fallback and producing no useful Elo updates.
+                all_results.append((pro, con, result))
+                continue
+            played[pro].add(con)
+            played[con].add(pro)
+            color_diff[pro] += 1
+            color_diff[con] -= 1
+            if result.winner == "Pro":
+                elo.update(pro, con)
+                scores[pro] += 1.0
+            elif result.winner == "Con":
+                elo.update(con, pro)
+                scores[con] += 1.0
+            else:
+                elo.update_draw(pro, con, elo_cfg.get("draw_penalty", 0))
+                scores[pro] += 0.5
+                scores[con] += 0.5
+            all_results.append((pro, con, result))
 
-    return results, elo
+    return all_results, elo
