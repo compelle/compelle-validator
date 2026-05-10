@@ -77,19 +77,38 @@ def strip_thinking(text: str, tags: list[str]) -> str:
     return text.strip()
 
 
+# Strategies must reference an immutable gist revision (40-hex SHA-1). Mutable
+# refs like `gist:<id>` are rejected so a miner can't swap their committed
+# strategy after the fact.
+_GIST_REVISIONED_RE = re.compile(r"^gist:([0-9a-f]{20,40})/([0-9a-f]{40})$")
+_gist_cache: dict[tuple[str, str], str] = {}
+
+
 def resolve_strategy(commitment: str) -> str:
     if not commitment.startswith("gist:"):
         return commitment if len(commitment.encode("utf-8")) <= MAX_STRATEGY_BYTES else ""
-    ref = commitment[5:]
-    if "/" not in ref:
+
+    m = _GIST_REVISIONED_RE.match(commitment)
+    if not m:
+        log.warning(f"reject gist commitment: malformed or missing revision: {commitment[:80]!r}")
         return ""
+
+    gist_id, revision = m.group(1), m.group(2)
+    cache_key = (gist_id, revision)
+    if cache_key in _gist_cache:
+        return _gist_cache[cache_key]
+
     try:
-        r = requests.get(f"https://api.github.com/gists/{ref}", timeout=10)
-        r.raise_for_status()
-        content = next(iter(r.json()["files"].values()))["content"]
-        return content if len(content.encode("utf-8")) <= MAX_STRATEGY_BYTES else ""
+        r = requests.get(f"https://api.github.com/gists/{gist_id}/{revision}", timeout=10)
+        r.raise_for_status()  # GitHub 422s on revisions not in history
+        files = r.json().get("files", {})
+        content = next(iter(files.values())).get("content", "") if files else ""
+        if len(content.encode("utf-8")) > MAX_STRATEGY_BYTES:
+            return ""
+        _gist_cache[cache_key] = content
+        return content
     except Exception as e:
-        log.error(f"gist {ref} fetch failed: {e}")
+        log.error(f"gist {commitment} fetch failed: {e}")
         return ""
 
 
@@ -105,6 +124,9 @@ class GameResult:
     completed_at: str = ""
     topic_data: dict | None = None
     topic_id: str = ""
+    # Per-judge votes when a panel decides the verdict (empty for concession-decided
+    # games or single-judge fallback). Each entry: {"model","verdict","reason"}.
+    judge_panel_votes: list = field(default_factory=list)
 
 
 def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
@@ -170,31 +192,27 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
     return judge_game(llm, config, topic_obj, motion, transcript, time.time() - start)
 
 
-def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResult:
-    cfg = config["game"]
-    transcript_text = "\n\n".join(f"[{e['speaker']}]: {e['text']}" for e in transcript)
-    prompt = config["judge_prompt"].format(topic=motion, transcript=transcript_text)
-    primary = cfg.get("judge_model", cfg["model"])
-    fallbacks = cfg.get("judge_model_fallbacks", cfg.get("model_fallbacks", []))
-    tags = config.get("thinking_tags") or ["think"]
+def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[str, str] | None:
+    """Run a single judge model. Returns (verdict, reason) or None on failure.
 
-    tid = topic_id(topic_obj)
-    for attempt in range(3):
+    Each panel member is queried with itself as primary and NO fallback — we
+    want OTHER panel members to vote, not for a single judge's failure to
+    cascade across the panel and pollute the diversity. Two attempts at
+    increasing temperature in case the model fails to produce a clean PRO/CON.
+    """
+    for attempt in range(2):
         try:
-            verdict = _chat(
-                llm,
+            verdict = llm.chat(
                 "You are an impartial debate judge. You MUST pick a winner. "
                 "Respond with exactly PRO or CON on the first line.",
                 [{"role": "user", "content": prompt}],
-                primary, fallbacks, max_tok=2048, temp=0.3 + attempt * 0.2,
+                judge_model, max_tokens=2048, temperature=0.3 + attempt * 0.2,
             )
         except Exception as e:
-            if attempt == 2:
-                return GameResult(motion, "draw", f"Judge error: {e}",
-                                  len(transcript), transcript, duration,
-                                  topic_data=topic_obj, topic_id=tid)
+            log.warning("judge %s attempt %d failed: %s", judge_model, attempt + 1, str(e)[:80])
+            if attempt == 1:
+                return None
             continue
-
         clean = strip_thinking(verdict, tags) or verdict.strip()
         lines = [line.strip() for line in clean.split("\n") if line.strip()]
         if not lines:
@@ -202,13 +220,93 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
         match = re.match(r"^[*\"]*(\w+)", lines[0].upper())
         winner = _VERDICT_WORDS.get(match.group(1)) if match else None
         if winner:
-            return GameResult(motion, winner, "Judge decision",
-                              len(transcript), transcript, duration,
-                              " ".join(lines[1:]), topic_data=topic_obj, topic_id=tid)
+            return (winner, " ".join(lines[1:]))
+    return None
 
-    return GameResult(motion, "draw", "Judge indecisive",
-                      len(transcript), transcript, duration,
-                      topic_data=topic_obj, topic_id=tid)
+
+def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResult:
+    """Judge a debate via configurable judge panel.
+
+    Reads `judge_panel` from game config (list of model IDs). Falls back to the
+    legacy single-judge config (judge_model + judge_model_fallbacks) when
+    judge_panel is absent or empty. Panel members vote independently in
+    parallel and the majority verdict wins. With odd panel sizes ties are
+    impossible barring all-judge failure.
+    """
+    cfg = config["game"]
+    transcript_text = "\n\n".join(f"[{e['speaker']}]: {e['text']}" for e in transcript)
+    prompt = config["judge_prompt"].format(topic=motion, transcript=transcript_text)
+    tags = config.get("thinking_tags") or ["think"]
+    tid = topic_id(topic_obj)
+
+    panel = cfg.get("judge_panel") or []
+    if not panel:
+        # Legacy path: single-judge with fallbacks via _chat.
+        primary = cfg.get("judge_model", cfg["model"])
+        fallbacks = cfg.get("judge_model_fallbacks", cfg.get("model_fallbacks", []))
+        for attempt in range(3):
+            try:
+                verdict = _chat(
+                    llm,
+                    "You are an impartial debate judge. You MUST pick a winner. "
+                    "Respond with exactly PRO or CON on the first line.",
+                    [{"role": "user", "content": prompt}],
+                    primary, fallbacks, max_tok=2048, temp=0.3 + attempt * 0.2,
+                )
+            except Exception as e:
+                if attempt == 2:
+                    return GameResult(motion, "draw", f"Judge error: {e}",
+                                      len(transcript), transcript, duration,
+                                      topic_data=topic_obj, topic_id=tid)
+                continue
+            clean = strip_thinking(verdict, tags) or verdict.strip()
+            lines = [line.strip() for line in clean.split("\n") if line.strip()]
+            if not lines:
+                continue
+            match = re.match(r"^[*\"]*(\w+)", lines[0].upper())
+            winner = _VERDICT_WORDS.get(match.group(1)) if match else None
+            if winner:
+                return GameResult(motion, winner, "Judge decision",
+                                  len(transcript), transcript, duration,
+                                  " ".join(lines[1:]), topic_data=topic_obj, topic_id=tid)
+        return GameResult(motion, "draw", "Judge indecisive",
+                          len(transcript), transcript, duration,
+                          topic_data=topic_obj, topic_id=tid)
+
+    # Panel path: run each judge in parallel, take majority vote. Panel members
+    # do NOT use fallbacks — the panel itself is the resilience mechanism.
+    votes: list = []  # list of (verdict, reason, model)
+    with ThreadPoolExecutor(max_workers=min(len(panel), 8)) as ex:
+        futs = {ex.submit(_judge_one, llm, config, m, prompt, tags): m for m in panel}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r is not None:
+                votes.append((r[0], r[1], futs[fut]))
+
+    panel_record = [{"model": m, "verdict": w, "reason": (rsn or "")[:280]}
+                    for (w, rsn, m) in votes]
+
+    if not votes:
+        return GameResult(motion, "draw", "Panel all failed",
+                          len(transcript), transcript, duration,
+                          topic_data=topic_obj, topic_id=tid,
+                          judge_panel_votes=panel_record)
+
+    pro_count = sum(1 for (w, _, _) in votes if w == "Pro")
+    con_count = sum(1 for (w, _, _) in votes if w == "Con")
+    if pro_count == con_count:
+        # Only reachable with even-sized panel and split votes.
+        return GameResult(motion, "draw", f"Panel split {pro_count}-{con_count}",
+                          len(transcript), transcript, duration,
+                          topic_data=topic_obj, topic_id=tid,
+                          judge_panel_votes=panel_record)
+
+    winner = "Pro" if pro_count > con_count else "Con"
+    explanation = next(rsn for (w, rsn, _) in votes if w == winner)
+    return GameResult(motion, winner, f"Panel verdict {pro_count}-{con_count}",
+                      len(transcript), transcript, duration, explanation,
+                      topic_data=topic_obj, topic_id=tid,
+                      judge_panel_votes=panel_record)
 
 
 class Elo:
