@@ -21,6 +21,9 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
+# Optional: drop a watchtower.env file with COMPELLE_TARGET_REF=origin/<branch>
+# to follow a canary branch instead of main. Absent file = follow main.
+EnvironmentFile=-/etc/compelle/watchtower.env
 ExecStart=/opt/compelle-validator/deploy/upgrade.sh --auto
 StandardOutput=journal
 StandardError=journal
