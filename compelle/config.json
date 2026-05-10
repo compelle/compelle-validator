@@ -11,10 +11,15 @@
 
   "old_config": {
     "game": {
-      "model": "deepseek-ai/DeepSeek-R1-0528-TEE",
-      "model_fallbacks": ["Qwen/Qwen3-235B-A22B-Thinking-2507", "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
-      "judge_model": "deepseek-ai/DeepSeek-R1-0528-TEE",
-      "judge_model_fallbacks": ["Qwen/Qwen3-235B-A22B-Thinking-2507", "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
+      "model": "zai-org/GLM-5.1-TEE",
+      "model_fallbacks": ["Qwen/Qwen3-235B-A22B-Thinking-2507", "moonshotai/Kimi-K2.6-TEE", "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
+      "judge_panel": [
+        "zai-org/GLM-5.1-TEE",
+        "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "moonshotai/Kimi-K2.6-TEE",
+        "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE",
+        "MiniMaxAI/MiniMax-M2.5-TEE"
+      ],
       "max_turns": 5,
       "max_tokens_per_turn": 3072,
       "temperature": 0.6,

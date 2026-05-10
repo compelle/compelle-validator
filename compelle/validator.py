@@ -24,6 +24,10 @@ log = logging.getLogger("compelle.validator")
 # `COMPELLE_DATA_DIR=` with no value) doesn't silently resolve to "" and write
 # state files to the filesystem root.
 DATA_DIR = os.environ.get("COMPELLE_DATA_DIR") or "data"
+# Local-only health snapshot for operator monitoring. Written atomically once
+# per loop. Override the path via COMPELLE_HEALTH_PATH; default sits next to
+# the epoch archive in DATA_DIR.
+HEALTH_PATH = os.environ.get("COMPELLE_HEALTH_PATH") or f"{DATA_DIR}/health.json"
 # Canonical R2 ingest endpoint. Used as the fallback when neither
 # COMPELLE_PUSH_URL nor config.json's push_url is set to a non-empty value.
 DEFAULT_PUSH_URL = "https://compelle-ingest.compelle.workers.dev/ingest"
@@ -297,6 +301,52 @@ def push_pending(push_url: str, wallet) -> None:
         log.warning(f"pushed.json save failed: {e}")
 
 
+def _count_pending_pushes() -> int:
+    on_disk = set()
+    for path in glob.glob(f"{DATA_DIR}/epoch_*.json.gz"):
+        block = _block_from_filename(os.path.basename(path))
+        if block is not None:
+            on_disk.add(block)
+    try:
+        with open(PUSHED_PATH) as f:
+            pushed = {int(b) for b in json.load(f)} & on_disk
+    except (OSError, ValueError):
+        pushed = set()
+    return len(on_disk - pushed)
+
+
+def write_health(epoch: int, last_progress_ts: float, current_block: int,
+                 last_sw_block, last_sw_status, last_sw_ts) -> None:
+    """Atomically write a snapshot of validator state for operator monitoring.
+
+    Strictly local file. No HTTP, no network. Operators can `cat
+    data/health.json` to debug or wire up their own monitoring however they
+    like. Override the path via COMPELLE_HEALTH_PATH if needed.
+    """
+    try:
+        from compelle import FULL_VERSION
+        os.makedirs(os.path.dirname(HEALTH_PATH) or ".", exist_ok=True)
+        now = int(time.time())
+        snapshot = {
+            "ts": now,
+            "version": FULL_VERSION,
+            "epoch": epoch,
+            "current_block": current_block,
+            "last_progress_age_s": max(0, now - int(last_progress_ts)),
+            "last_set_weights_block": last_sw_block,
+            "last_set_weights_status": last_sw_status,
+            "last_set_weights_at": int(last_sw_ts) if last_sw_ts else None,
+            "pending_pushes": _count_pending_pushes(),
+            "chutes_quota_reset_at": None,
+        }
+        tmp = HEALTH_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f, indent=2)
+        os.replace(tmp, HEALTH_PATH)
+    except Exception as e:
+        log.warning(f"health.json write failed (non-fatal): {e}")
+
+
 ELO_STATE_PATH = f"{DATA_DIR}/elo_state.json"
 LAST_TEMPO_PATH = f"{DATA_DIR}/last_completed_tempo.txt"
 
@@ -419,12 +469,21 @@ def main():
     cached_overrides: dict = {}
     cached_revision = "bundled"
     epoch = 0
+    # Most recent set_weights attempt — surfaced via data/health.json so
+    # operators can monitor "is mine stuck?" without scraping logs.
+    last_sw_block = None
+    last_sw_status = None
+    last_sw_ts = None
 
     while True:
         last_progress[0] = time.time()
         epoch += 1
         log.info(f"=== epoch {epoch} ===")
 
+        # Fresh Subtensor per epoch dodges stuck-socket hangs, but the websocket
+        # must be released or it accumulates against the public RPC endpoint and
+        # eventually trips per-IP 429s. Close at every exit path below.
+        sub = None
         try:
             sub = bt.Subtensor(network=cfg["network"])
             epoch_start_block = sub.get_current_block()
@@ -432,6 +491,9 @@ def main():
             records = fetch_records(sub, netuid, block=epoch_start_block, block_hash=block_hash)
         except Exception as e:
             log.error(f"chain unreachable: {e}; retry 60s")
+            if sub is not None:
+                try: sub.close()
+                except Exception: pass
             time.sleep(60)
             epoch -= 1
             continue
@@ -507,11 +569,16 @@ def main():
             log.info("no weights to set this epoch")
             sw_status = "skipped"
         last_progress[0] = time.time()  # set_weights / chain ops finished, watchdog should see it
+        last_sw_block = epoch_start_block
+        last_sw_status = sw_status
+        last_sw_ts = time.time()
 
         write_epoch(epoch, epoch_start_block, cached_revision, records, weights, results, elo,
                     sw_status)
         prune_epochs(keep_epochs)
         push_pending(cfg["push_url"], wallet)
+        write_health(epoch, last_progress[0], epoch_start_block,
+                     last_sw_block, last_sw_status, last_sw_ts)
 
         # On set_weights failure, retry within the same tempo by waking up
         # quickly. The next iteration will see current_tempo <= last_tempo,
@@ -523,6 +590,8 @@ def main():
         else:
             sleep_secs = cfg["tournament"]["epoch_seconds"]
         log.info(f"epoch {epoch} done; next in {sleep_secs}s")
+        try: sub.close()
+        except Exception as e: log.warning(f"subtensor close failed: {e}")
         _heartbeat_sleep(last_progress, sleep_secs)
 
 
