@@ -5,7 +5,7 @@ import bittensor as bt
 
 EPSILON_PLACEHOLDER = "epsilon"
 VALIDATOR_DATA_PREFIX = "vdata:"
-ELIGIBILITY_WINDOW_BLOCKS = 100  # 20 min @ 12s/block; gives buffer for slow commitment after registration
+ELIGIBILITY_WINDOW_BLOCKS = 200  # 40 min @ 12s/block; covers slow commitment + chain congestion after registration
 EPS_BUDGET = 0.001
 EPS_AGE_FLOOR = 50
 
