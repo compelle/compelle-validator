@@ -1,4 +1,6 @@
 import re
+import os
+import json
 import math
 import time
 import random
@@ -81,7 +83,46 @@ def strip_thinking(text: str, tags: list[str]) -> str:
 # refs like `gist:<id>` are rejected so a miner can't swap their committed
 # strategy after the fact.
 _GIST_REVISIONED_RE = re.compile(r"^gist:([0-9a-f]{20,40})/([0-9a-f]{40})$")
+# Cache (gist_id, revision) → resolved text. Persisted to disk so a validator
+# restart doesn't re-spend the GitHub anonymous-API quota (60 req/hr/IP) on
+# fetches we've already done. Revisions are immutable by SHA-1, so a hit is
+# safe forever; we never invalidate.
+_GIST_CACHE_PATH = os.environ.get("COMPELLE_GIST_CACHE") or "data/gist_cache.json"
 _gist_cache: dict[tuple[str, str], str] = {}
+_gist_cache_loaded = False
+
+
+def _load_gist_cache() -> None:
+    global _gist_cache_loaded
+    if _gist_cache_loaded:
+        return
+    _gist_cache_loaded = True
+    try:
+        with open(_GIST_CACHE_PATH) as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if "/" in k and isinstance(v, str):
+                gid, rev = k.split("/", 1)
+                _gist_cache[(gid, rev)] = v
+        log.info(f"loaded gist cache: {len(_gist_cache)} entries from {_GIST_CACHE_PATH}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"gist cache load failed ({e}); starting empty")
+
+
+def _save_gist_cache() -> None:
+    try:
+        d = os.path.dirname(_GIST_CACHE_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = _GIST_CACHE_PATH + ".tmp"
+        out = {f"{gid}/{rev}": v for (gid, rev), v in _gist_cache.items()}
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, _GIST_CACHE_PATH)
+    except Exception as e:
+        log.warning(f"gist cache save failed: {e}")
 
 
 def resolve_strategy(commitment: str) -> str:
@@ -95,6 +136,7 @@ def resolve_strategy(commitment: str) -> str:
 
     gist_id, revision = m.group(1), m.group(2)
     cache_key = (gist_id, revision)
+    _load_gist_cache()
     if cache_key in _gist_cache:
         return _gist_cache[cache_key]
 
@@ -115,6 +157,7 @@ def resolve_strategy(commitment: str) -> str:
         if len(content.encode("utf-8")) > MAX_STRATEGY_BYTES:
             return ""
         _gist_cache[cache_key] = content
+        _save_gist_cache()
         return content
     except Exception as e:
         log.error(f"gist {commitment} fetch failed: {e}")
