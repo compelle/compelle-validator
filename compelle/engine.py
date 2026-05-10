@@ -249,6 +249,53 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
     return None
 
 
+def _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
+                  panel_record=None, reason_prefix=""):
+    """Single-judge decision via the legacy primary+fallback chain.
+
+    Used in two paths:
+      1. judge_panel is absent or empty in config (legacy operators)
+      2. Panel returned < 3 successful votes (safety net — see judge_game)
+    """
+    cfg = config["game"]
+    transcript_text = "\n\n".join(f"[{e['speaker']}]: {e['text']}" for e in transcript)
+    prompt = config["judge_prompt"].format(topic=motion, transcript=transcript_text)
+    tags = config.get("thinking_tags") or ["think"]
+    primary = cfg.get("judge_model", cfg["model"])
+    fallbacks = cfg.get("judge_model_fallbacks", cfg.get("model_fallbacks", []))
+    for attempt in range(3):
+        try:
+            verdict = _chat(
+                llm,
+                "You are an impartial debate judge. You MUST pick a winner. "
+                "Respond with exactly PRO or CON on the first line.",
+                [{"role": "user", "content": prompt}],
+                primary, fallbacks, max_tok=2048, temp=0.3 + attempt * 0.2,
+            )
+        except Exception as e:
+            if attempt == 2:
+                return GameResult(motion, "draw", f"{reason_prefix}Judge error: {e}",
+                                  len(transcript), transcript, duration,
+                                  topic_data=topic_obj, topic_id=tid,
+                                  judge_panel_votes=panel_record)
+            continue
+        clean = strip_thinking(verdict, tags) or verdict.strip()
+        lines = [line.strip() for line in clean.split("\n") if line.strip()]
+        if not lines:
+            continue
+        match = re.match(r"^[*\"]*(\w+)", lines[0].upper())
+        winner = _VERDICT_WORDS.get(match.group(1)) if match else None
+        if winner:
+            return GameResult(motion, winner, f"{reason_prefix}Judge decision",
+                              len(transcript), transcript, duration,
+                              " ".join(lines[1:]), topic_data=topic_obj, topic_id=tid,
+                              judge_panel_votes=panel_record)
+    return GameResult(motion, "draw", f"{reason_prefix}Judge indecisive",
+                      len(transcript), transcript, duration,
+                      topic_data=topic_obj, topic_id=tid,
+                      judge_panel_votes=panel_record)
+
+
 def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResult:
     """Judge a debate via configurable judge panel.
 
@@ -257,6 +304,11 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     judge_panel is absent or empty. Panel members vote independently in
     parallel and the majority verdict wins. With odd panel sizes ties are
     impossible barring all-judge failure.
+
+    Safety net: if fewer than 3 panel members produce a valid vote (i.e. one
+    or more models are down or returning malformed verdicts), fall through to
+    the single-judge path. Threshold of 3 is the smallest sample for a
+    statistically meaningful majority.
     """
     cfg = config["game"]
     transcript_text = "\n\n".join(f"[{e['speaker']}]: {e['text']}" for e in transcript)
@@ -266,37 +318,7 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
 
     panel = cfg.get("judge_panel") or []
     if not panel:
-        # Legacy path: single-judge with fallbacks via _chat.
-        primary = cfg.get("judge_model", cfg["model"])
-        fallbacks = cfg.get("judge_model_fallbacks", cfg.get("model_fallbacks", []))
-        for attempt in range(3):
-            try:
-                verdict = _chat(
-                    llm,
-                    "You are an impartial debate judge. You MUST pick a winner. "
-                    "Respond with exactly PRO or CON on the first line.",
-                    [{"role": "user", "content": prompt}],
-                    primary, fallbacks, max_tok=2048, temp=0.3 + attempt * 0.2,
-                )
-            except Exception as e:
-                if attempt == 2:
-                    return GameResult(motion, "draw", f"Judge error: {e}",
-                                      len(transcript), transcript, duration,
-                                      topic_data=topic_obj, topic_id=tid)
-                continue
-            clean = strip_thinking(verdict, tags) or verdict.strip()
-            lines = [line.strip() for line in clean.split("\n") if line.strip()]
-            if not lines:
-                continue
-            match = re.match(r"^[*\"]*(\w+)", lines[0].upper())
-            winner = _VERDICT_WORDS.get(match.group(1)) if match else None
-            if winner:
-                return GameResult(motion, winner, "Judge decision",
-                                  len(transcript), transcript, duration,
-                                  " ".join(lines[1:]), topic_data=topic_obj, topic_id=tid)
-        return GameResult(motion, "draw", "Judge indecisive",
-                          len(transcript), transcript, duration,
-                          topic_data=topic_obj, topic_id=tid)
+        return _single_judge(llm, config, topic_obj, motion, transcript, duration, tid)
 
     # Panel path: run each judge in parallel, take majority vote. Panel members
     # do NOT use fallbacks — the panel itself is the resilience mechanism.
@@ -311,16 +333,23 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     panel_record = [{"model": m, "verdict": w, "reason": (rsn or "")[:280]}
                     for (w, rsn, m) in votes]
 
-    if not votes:
-        return GameResult(motion, "draw", "Panel all failed",
-                          len(transcript), transcript, duration,
-                          topic_data=topic_obj, topic_id=tid,
-                          judge_panel_votes=panel_record)
+    # Safety net: fewer than 3 valid votes means the panel is too noisy to
+    # produce a reliable majority. Fall back to the single-judge path with
+    # the model fallback chain, attaching the partial panel record so the
+    # epoch JSON still records what each panel member said (or didn't).
+    if len(votes) < 3:
+        log.warning(f"panel returned {len(votes)} valid votes (<3); "
+                    f"falling back to single-judge")
+        return _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
+                             panel_record=panel_record,
+                             reason_prefix="Panel-insufficient → ")
 
     pro_count = sum(1 for (w, _, _) in votes if w == "Pro")
     con_count = sum(1 for (w, _, _) in votes if w == "Con")
     if pro_count == con_count:
-        # Only reachable with even-sized panel and split votes.
+        # Reachable with even-sized panel and split votes (e.g., 4-judge 2-2).
+        # With the configured 5-judge panel this only fires if exactly one
+        # judge fails AND the remaining 4 split evenly, which is rare.
         return GameResult(motion, "draw", f"Panel split {pro_count}-{con_count}",
                           len(transcript), transcript, duration,
                           topic_data=topic_obj, topic_id=tid,

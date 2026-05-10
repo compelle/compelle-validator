@@ -14,9 +14,7 @@
       "model": "zai-org/GLM-5.1-TEE",
       "model_fallbacks": ["Qwen/Qwen3-235B-A22B-Thinking-2507", "moonshotai/Kimi-K2.6-TEE", "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
       "judge_panel": [
-        "zai-org/GLM-5.1-TEE",
         "Qwen/Qwen3-235B-A22B-Thinking-2507",
-        "moonshotai/Kimi-K2.6-TEE",
         "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE",
         "MiniMaxAI/MiniMax-M2.5-TEE"
       ],
