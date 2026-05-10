@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import bittensor as bt
 import requests
 
-from compelle.engine import LLM, Elo, run_tournament, resolve_strategy
+from compelle.engine import LLM, Elo, run_tournament, resolve_strategy, _GIST_REVISIONED_RE
 from compelle.eligibility import fetch_records, assign_weights
 
 
@@ -93,7 +93,11 @@ def _validate_topics(topics) -> bool:
 
 def fetch_config(gist_id: str, expected_owner: str, current_block: int) -> tuple[dict | None, str]:
     try:
-        r = requests.get(f"https://api.github.com/gists/{gist_id}", timeout=10)
+        headers = {}
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        if token:
+            headers["Authorization"] = f"token {token}"
+        r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()
         revision = (data.get("history") or [{}])[0].get("version", "")
@@ -203,7 +207,7 @@ def set_weights(sub, wallet, netuid, uids, vals) -> bool:
 
 
 def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, elo,
-                set_weights_status):
+                set_weights_status, real_strategies=None):
     os.makedirs(DATA_DIR, exist_ok=True)
     from compelle import FULL_VERSION
     # All games in a tournament share one topic now, so surface it at the top.
@@ -214,6 +218,12 @@ def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, 
             "id": getattr(first, "topic_id", ""),
             "motion": first.topic,
         }
+    # `played` is the source of truth for "actually entered the tournament":
+    # tier=real reflects only is_real (timing + non-epsilon + non-vdata) and
+    # silently lets through hotkeys whose gist commitment doesn't resolve. A
+    # downstream consumer reading the archive shouldn't have to derive that
+    # by intersecting `tier` with `weight>0` and Elo state.
+    played_set = set((real_strategies or {}).keys())
     payload = {
         "epoch": epoch,
         "epoch_block": epoch_block,
@@ -226,6 +236,7 @@ def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, 
             hk: {
                 "uid": r.uid,
                 "tier": "real" if r.is_real else ("epsilon" if r.is_placeholder else "ineligible"),
+                "played": hk in played_set,
                 "elo": elo.ratings.get(hk),
                 "weight": weights.get(hk, 0.0),
             }
@@ -367,6 +378,36 @@ def save_elo(elo) -> None:
         os.replace(tmp, ELO_STATE_PATH)
     except Exception as e:
         log.warning(f"elo save failed: {e}")
+
+
+def prune_stale_elo(elo, records) -> int:
+    """Drop Elo entries whose hotkey is unreachable from this epoch's chain
+    state. Two cuts, both safe:
+
+      1. Hotkey not in current metagraph records (deregistered). The slot may
+         later be re-registered to a different operator on the same UID — we
+         must not carry their predecessor's rating forward.
+      2. Hotkey is registered but its current commitment is structurally
+         malformed (gist:<id>/<rev> regex rejection). This is a deterministic
+         rejection, not a transient fetch failure, so it's safe to act on.
+         If the miner repairs their commitment, they start fresh at `initial`.
+
+    Hotkeys whose gist passes the regex but fails to fetch (e.g., transient
+    GitHub 403) are NOT pruned — their stored rating is held in case the next
+    fetch succeeds. The post-tournament filter already excludes them from
+    weights for this epoch via real_strategies.
+    """
+    to_remove = []
+    for hk in list(elo.ratings.keys()):
+        if hk not in records:
+            to_remove.append(hk)
+            continue
+        text = (records[hk].commitment_text or "").strip()
+        if text.startswith("gist:") and not _GIST_REVISIONED_RE.match(text):
+            to_remove.append(hk)
+    for hk in to_remove:
+        del elo.ratings[hk]
+    return len(to_remove)
 
 
 def load_elo(default_k: float, default_initial: float):
@@ -567,6 +608,9 @@ def main():
                     # is preferable in this order — on restart we'd skip the
                     # tournament (stale Elo) instead of double-counting matches.
                     set_last_tempo(current_tempo)
+                    n_pruned = prune_stale_elo(elo, records)
+                    if n_pruned:
+                        log.info(f"pruned {n_pruned} stale Elo entries (deregistered or malformed gist)")
                     save_elo(elo)
 
         # Drop hotkeys whose CURRENT commitment doesn't resolve, even if they
@@ -600,7 +644,7 @@ def main():
         last_sw_ts = time.time()
 
         write_epoch(epoch, epoch_start_block, cached_revision, records, weights, results, elo,
-                    sw_status)
+                    sw_status, real_strategies=real_strategies)
         prune_epochs(keep_epochs)
         push_pending(cfg["push_url"], wallet)
         write_health(epoch, last_progress[0], epoch_start_block,

@@ -141,7 +141,15 @@ def resolve_strategy(commitment: str) -> str:
         return _gist_cache[cache_key]
 
     try:
-        r = requests.get(f"https://api.github.com/gists/{gist_id}/{revision}", timeout=10)
+        # Anonymous GitHub API is 60 req/hr/IP — fine when the cache is warm,
+        # painful at first boot. Operators who set GITHUB_TOKEN get 5000 req/hr.
+        # No token = unchanged behavior.
+        headers = {}
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        if token:
+            headers["Authorization"] = f"token {token}"
+        r = requests.get(f"https://api.github.com/gists/{gist_id}/{revision}",
+                         headers=headers, timeout=10)
         r.raise_for_status()  # GitHub 422s on revisions not in history
         files = r.json().get("files", {})
         if not files:
