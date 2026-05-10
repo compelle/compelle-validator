@@ -365,7 +365,8 @@ class Elo:
         return {k: v / total for k, v in e.items()}
 
 
-def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None):
+def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
+                   on_progress=None):
     hotkeys = list(strategies.keys())
     if len(hotkeys) < 2:
         return [], elo or Elo()
@@ -415,6 +416,15 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None):
                 completed.append(fut.result())
             except Exception as e:
                 log.error(f"game error: {e}")
+            # Pulse the watchdog after each game (success or failure). Without
+            # this, large tournaments can exceed the watchdog timeout even
+            # while making steady progress, causing systemd to kill+restart
+            # mid-tournament and lose all completed games.
+            if on_progress is not None:
+                try:
+                    on_progress()
+                except Exception as e:
+                    log.warning(f"on_progress callback failed: {e}")
 
     completed.sort(key=lambda x: x[0])
     results = []

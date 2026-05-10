@@ -554,8 +554,13 @@ def main():
             if not ok:
                 log.warning(f"LLM preflight failed: {err[:200]}")
             else:
-                results, elo = run_tournament(llm, cfg, real_strategies,
-                                              epoch_start_block, elo=elo)
+                results, elo = run_tournament(
+                    llm, cfg, real_strategies, epoch_start_block, elo=elo,
+                    # Pulse the watchdog after each completed game so a long
+                    # tournament (many miners × many turns) doesn't false-kill
+                    # under a fixed-wall-clock watchdog timeout.
+                    on_progress=lambda: last_progress.__setitem__(0, time.time()),
+                )
                 if results:
                     real_weights = elo.weights(cfg["elo"]["temperature"])
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
