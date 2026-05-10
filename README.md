@@ -105,20 +105,27 @@ sudo /opt/compelle-validator/deploy/upgrade.sh
 
 The script fetches `origin/main`, shows the diff (commit hash + message), asks for confirmation, then `git reset --hard` + restart. Pin a specific tag instead with `upgrade.sh v1.2.3`.
 
-### Watchtower (opt-in auto-update)
+### Watchtower (ON by default — auto-update)
 
-Auto-pull `origin/main` every 10 minutes and restart on change:
-
-```bash
-sudo systemctl enable --now compelle-watchtower.timer
-```
+Watchtower is **enabled by default** by `install.sh`. It auto-pulls `origin/main` every 10 minutes and restarts the validator on change. This keeps your validator on the latest code without operator action — at the cost of trusting the maintainers of `compelle-validator`.
 
 Risks (operator must accept):
 - We push a bad commit → all watchtower-enabled validators crash together
 - We push a malicious commit (compromised github account) → validators run it
 - Mitigation: keep an eye on `journalctl -u compelle-watchtower` after announcements
 
-To disable: `sudo systemctl disable --now compelle-watchtower.timer`.
+To **disable** (and update only when you choose):
+```bash
+sudo systemctl disable --now compelle-watchtower.timer
+```
+
+After disabling, run `sudo /opt/compelle-validator/deploy/upgrade.sh` manually whenever you want to pull the latest. Pin a specific tag with `upgrade.sh v1.2.3`.
+
+To **canary a non-main branch** before main lands a change (e.g., `staging`):
+```bash
+echo "COMPELLE_TARGET_REF=origin/staging" | sudo tee /etc/compelle/watchtower.env
+sudo systemctl daemon-reload && sudo systemctl restart compelle-watchtower.timer
+```
 
 ## License
 
