@@ -15,16 +15,27 @@ set -euo pipefail
 
 REPO_DIR="${COMPELLE_REPO_DIR:-/opt/compelle-validator}"
 SERVICE="${COMPELLE_SERVICE:-compelle-validator}"
-TARGET_REF="origin/main"
+# Default branch can be overridden via $COMPELLE_TARGET_REF (e.g., set
+# COMPELLE_TARGET_REF=origin/staging in /etc/compelle/watchtower.env to canary
+# a branch on a single operator before merging to main). CLI arg still wins
+# when non-blank. Empty/blank values from any path fall back to origin/main —
+# same posture as the COMPELLE_PUSH_URL fallback fix.
+TARGET_REF="${COMPELLE_TARGET_REF:-}"
 AUTO=0
 
-# Parse args: optional ref, optional --auto flag (used by watchtower timer)
+# Parse args: optional ref, optional --auto flag (used by watchtower timer).
+# Blank positional args are ignored so `upgrade.sh --auto ""` doesn't end up
+# with TARGET_REF="" and abort under set -u.
 for a in "$@"; do
     case "$a" in
         --auto) AUTO=1 ;;
+        "") ;;
         *) TARGET_REF="$a" ;;
     esac
 done
+
+# Final safety net: empty from env, empty from CLI, never set — all → origin/main.
+TARGET_REF="${TARGET_REF:-origin/main}"
 
 echo "=== compelle-validator upgrade ==="
 echo "  repo: $REPO_DIR"
