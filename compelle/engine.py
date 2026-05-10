@@ -102,7 +102,16 @@ def resolve_strategy(commitment: str) -> str:
         r = requests.get(f"https://api.github.com/gists/{gist_id}/{revision}", timeout=10)
         r.raise_for_status()  # GitHub 422s on revisions not in history
         files = r.json().get("files", {})
-        content = next(iter(files.values())).get("content", "") if files else ""
+        if not files:
+            return ""
+        # Reject ambiguous multi-file gists. Picking by dict-iteration order
+        # depends on GitHub's JSON-encoder behavior and is not a stable
+        # consensus primitive — different validators could read different
+        # files. Strategies must live in a single-file gist.
+        if len(files) > 1:
+            log.warning(f"reject gist {commitment}: has {len(files)} files (must be single-file)")
+            return ""
+        content = next(iter(files.values())).get("content", "") or ""
         if len(content.encode("utf-8")) > MAX_STRATEGY_BYTES:
             return ""
         _gist_cache[cache_key] = content

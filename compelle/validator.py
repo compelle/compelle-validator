@@ -104,7 +104,13 @@ def fetch_config(gist_id: str, expected_owner: str, current_block: int) -> tuple
         files = data.get("files") or {}
         if not files:
             return None, revision
-        content = next(iter(files.values())).get("content", "")
+        # Reject ambiguous multi-file config gists for the same reason
+        # resolve_strategy does: dict-iteration order is not stable
+        # cross-validator consensus.
+        if len(files) > 1:
+            log.error(f"config gist has {len(files)} files (must be single-file)")
+            return None, revision
+        content = next(iter(files.values())).get("content", "") or ""
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             log.error("gist content not a JSON object")
@@ -561,7 +567,16 @@ def main():
         real_weights = {hk: w for hk, w in real_weights.items()
                         if hk in records and records[hk].is_real}
         weights = assign_weights(records, real_weights, epoch_start_block)
-        if weights:
+        if weights and not real_weights:
+            # Epsilon-only epoch: assign_weights returned EPS_BUDGET-tiny
+            # weights for placeholder miners, but no real Elo signal exists.
+            # Submitting these consumes the WeightsRateLimit window for nothing
+            # useful. Skip set_weights and let the prior epoch's weights stand
+            # on chain until a real tournament can run.
+            log.info(f"epsilon-only epoch ({len(weights)} placeholder miners, 0 real); "
+                     f"skipping set_weights to preserve rate-limit window")
+            sw_status = "skipped_epsilon_only"
+        elif weights:
             uids = [records[hk].uid for hk in weights]
             vals = list(weights.values())
             sw_status = "succeeded" if set_weights(sub, wallet, netuid, uids, vals) else "failed"
