@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — first-time setup on a fresh validator VPS.
 #
-# Run as root after cloning the repo to /opt/compelle-validator and creating
-# /etc/compelle/validator.env with your CHUTES_API_KEY + BT_WALLET_NAME etc.
+# Run as root after cloning the repo to /opt/compelle-validator.
 #
 # Idempotent — safe to re-run. Will refresh the systemd unit symlinks and
 # restart services to pick up unit-file changes.
@@ -14,7 +13,7 @@ set -euo pipefail
 REPO_DIR="${COMPELLE_REPO_DIR:-/opt/compelle-validator}"
 
 if [ "$EUID" -ne 0 ]; then
-    echo "must run as root (systemctl + /etc writes)"
+    echo "must run as root (creates user, writes /etc, manages systemd)"
     exit 1
 fi
 
@@ -23,6 +22,21 @@ if [ ! -d "$REPO_DIR/deploy" ]; then
     exit 1
 fi
 
+echo "=== creating compelle service user (if missing) ==="
+if ! id -u compelle &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin compelle
+    echo "  created user: compelle (system, no login)"
+else
+    echo "  user already exists"
+fi
+
+echo ""
+echo "=== creating dirs ==="
+mkdir -p /var/lib/compelle /etc/compelle
+chown compelle:compelle /var/lib/compelle
+chmod 750 /var/lib/compelle
+
+echo ""
 echo "=== installing systemd units from $REPO_DIR/deploy ==="
 for unit in compelle-validator.service compelle-watchtower.service compelle-watchtower.timer; do
     src="$REPO_DIR/deploy/$unit"
@@ -32,26 +46,28 @@ for unit in compelle-validator.service compelle-watchtower.service compelle-watc
         continue
     fi
     cp "$src" "$dst"
+    chmod 644 "$dst"
     echo "  installed: $dst"
 done
 
 echo ""
-echo "=== ensuring /etc/compelle exists ==="
-mkdir -p /etc/compelle
-
-if [ ! -f /etc/compelle/validator.env ]; then
+echo "=== seeding /etc/compelle/env ==="
+if [ ! -f /etc/compelle/env ]; then
     if [ -f "$REPO_DIR/deploy/compelle.env.example" ]; then
-        cp "$REPO_DIR/deploy/compelle.env.example" /etc/compelle/validator.env
-        chmod 600 /etc/compelle/validator.env
-        echo "  seeded /etc/compelle/validator.env from compelle.env.example"
-        echo "  EDIT THIS FILE with your CHUTES_API_KEY + BT_WALLET_NAME etc, then re-run install.sh"
+        cp "$REPO_DIR/deploy/compelle.env.example" /etc/compelle/env
+        chown root:compelle /etc/compelle/env
+        chmod 640 /etc/compelle/env
+        echo "  seeded /etc/compelle/env from compelle.env.example (mode 0640, root:compelle)"
         echo ""
-        echo "  exiting so you can edit before services start"
+        echo "  EDIT IT NOW with your CHUTES_API_KEY + BT_WALLET_NAME etc, then re-run install.sh"
+        echo "  (exiting so services don't start with placeholder values)"
         exit 0
     else
-        echo "  no validator.env and no example to seed from — create /etc/compelle/validator.env manually"
+        echo "  no env file and no example to seed from — create /etc/compelle/env manually"
         exit 1
     fi
+else
+    echo "  /etc/compelle/env already exists, leaving it alone"
 fi
 
 echo ""
@@ -60,6 +76,7 @@ if [ ! -d "$REPO_DIR/.venv" ]; then
     python3 -m venv "$REPO_DIR/.venv"
 fi
 "$REPO_DIR/.venv/bin/pip" install -e "$REPO_DIR" --quiet
+echo "  installed (editable) into $REPO_DIR/.venv"
 
 echo ""
 echo "=== reloading systemd ==="
@@ -76,13 +93,14 @@ echo ""
 echo "=== done ==="
 echo ""
 echo "Watchtower is ON by default and will auto-pull origin/main every 10 min."
+echo ""
 echo "To disable auto-update:"
 echo "  systemctl disable --now compelle-watchtower.timer"
 echo ""
-echo "To canary a non-main branch on this validator:"
+echo "To canary a non-main branch on this validator instead of main:"
 echo "  echo 'COMPELLE_TARGET_REF=origin/staging' > /etc/compelle/watchtower.env"
 echo "  systemctl daemon-reload && systemctl restart compelle-watchtower.timer"
 echo ""
 echo "Logs:"
-echo "  validator:  journalctl -u compelle-validator -f  (or tail validator.log)"
-echo "  watchtower: journalctl -u compelle-watchtower -f"
+echo "  validator:   journalctl -u compelle-validator -f"
+echo "  watchtower:  journalctl -u compelle-watchtower -f"
