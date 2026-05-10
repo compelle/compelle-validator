@@ -255,8 +255,12 @@ def _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
 
     Used in two paths:
       1. judge_panel is absent or empty in config (legacy operators)
-      2. Panel returned < 3 successful votes (safety net — see judge_game)
+      2. Panel verdict ambiguous — couldn't produce a clear majority
     """
+    # Normalize panel_record to a list so GameResult.judge_panel_votes
+    # serializes as [] (the dataclass default) rather than null when the
+    # legacy no-panel path runs.
+    panel_record = panel_record if panel_record is not None else []
     cfg = config["game"]
     transcript_text = "\n\n".join(f"[{e['speaker']}]: {e['text']}" for e in transcript)
     prompt = config["judge_prompt"].format(topic=motion, transcript=transcript_text)
@@ -333,19 +337,19 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     panel_record = [{"model": m, "verdict": w, "reason": (rsn or "")[:280]}
                     for (w, rsn, m) in votes]
 
-    # Safety net: fewer than 3 valid votes means the panel is too noisy to
-    # produce a reliable majority. Fall back to the single-judge path with
-    # the model fallback chain, attaching the partial panel record so the
-    # epoch JSON still records what each panel member said (or didn't).
-    if len(votes) < 3:
-        log.warning(f"panel returned {len(votes)} valid votes (<3); "
+    # Safety net: only fall back to single-judge when the partial panel can't
+    # produce a clear winner — i.e., max side-count < 2. With a 3-judge panel
+    # plus one judge failing, a 2-0 partial result IS a clear majority and we
+    # should accept it; only 0/1-vote or split-1-1 cases need rejudging.
+    pro_count = sum(1 for (w, _, _) in votes if w == "Pro")
+    con_count = sum(1 for (w, _, _) in votes if w == "Con")
+    if max(pro_count, con_count) < 2:
+        log.warning(f"panel only {pro_count}-{con_count} ({len(votes)} valid votes); "
                     f"falling back to single-judge")
         return _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
                              panel_record=panel_record,
                              reason_prefix="Panel-insufficient → ")
 
-    pro_count = sum(1 for (w, _, _) in votes if w == "Pro")
-    con_count = sum(1 for (w, _, _) in votes if w == "Con")
     if pro_count == con_count:
         # Reachable with even-sized panel and split votes (e.g., 4-judge 2-2).
         # With the configured 5-judge panel this only fires if exactly one
@@ -459,7 +463,10 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
     results = []
     for _, pro, con, result in completed:
         reason = (result.reason or "").lower()
-        if reason.startswith(("llm error", "judge error")):
+        # `in` instead of `startswith` so the panel-fallback path's prefixed
+        # form ("Panel-insufficient → Judge error: ...") is also recognized
+        # as an infrastructure failure that should NOT update Elo.
+        if "llm error" in reason or "judge error" in reason:
             pass
         elif result.winner == "Pro":
             elo.update(pro, con)
