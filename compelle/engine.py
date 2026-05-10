@@ -130,6 +130,12 @@ class GameResult:
 
 
 def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
+    """Try `primary` first, then each fallback. Falls back on:
+      - ModelNotAvailableError (404 / unknown model)
+      - persistent throttling (429) or upstream outage (503/502/504) — these
+        are exhausted by `LLM.chat`'s internal retry first, so by the time we
+        catch one here the primary has already burned its retries.
+    """
     models = [primary] + [m for m in fallbacks if m != primary]
     last: Exception | None = None
     for m in models:
@@ -138,6 +144,16 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
         except ModelNotAvailableError as e:
             log.warning("model %s unavailable, falling back", m)
             last = e
+        except Exception as e:
+            s = str(e).lower()
+            transient = any(c in s for c in ("429", "503", "502", "504",
+                                              "rate limit", "overloaded",
+                                              "service unavailable", "timeout"))
+            if transient and m != models[-1]:
+                log.warning("model %s transient error (%s), falling back", m, s[:80])
+                last = e
+                continue
+            raise
     raise last  # type: ignore[misc]
 
 
@@ -351,7 +367,13 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None):
     for hk in hotkeys:
         elo.get(hk)
 
-    rng = random.Random(epoch_start_block)
+    # Seed off the tempo bucket, NOT the sampled epoch_start_block. Validators
+    # that observe the chain at slightly different blocks within the same tempo
+    # would otherwise produce different matchup orderings (and thus different
+    # Elo paths). Topic selection already uses the tempo bucket below.
+    tempo = config.get("tempo_blocks", 360)
+    tempo_index = epoch_start_block // tempo
+    rng = random.Random(tempo_index)
     matchups = [m for a, b in itertools.combinations(hotkeys, 2) for m in ((a, b), (b, a))]
     rng.shuffle(matchups)
 
@@ -364,8 +386,7 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None):
     if not topics:
         log.warning("no topics in config; skipping tournament")
         return [], elo
-    tempo = config.get("tempo_blocks", 360)
-    topic_index = (epoch_start_block // tempo) % len(topics)
+    topic_index = tempo_index % len(topics)
     chosen_topic = topics[topic_index]
     log.info(f"tournament topic: index={topic_index}/{len(topics)} "
              f"id={topic_id(chosen_topic)} motion={chosen_topic.get('motion','')[:80]!r}")

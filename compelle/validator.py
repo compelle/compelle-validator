@@ -1,10 +1,12 @@
 import os
+import sys
 import json
 import gzip
 import time
 import glob
 import hashlib
 import logging
+import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -118,22 +120,78 @@ def fetch_config(gist_id: str, expected_owner: str, current_block: int) -> tuple
     return None, ""
 
 
+def _within_rate_limit(sub, netuid: int, my_uid: int) -> int:
+    """Return blocks remaining until set_weights is allowed again, or 0 if free.
+
+    The chain enforces SubtensorModule::WeightsRateLimit between successive
+    set_weights / commit_weights calls per UID. Calling within the window
+    silently fails with success=False / message=None — useless for diagnosis
+    and burns retries. Query LastUpdate + WeightsRateLimit and skip preemptively.
+    """
+    try:
+        last_update = sub.substrate.query("SubtensorModule", "LastUpdate", [netuid]).value
+        rate_limit = sub.weights_rate_limit(netuid)
+        current = sub.get_current_block()
+    except Exception as e:
+        log.warning(f"rate-limit pre-check failed: {e}; will attempt anyway")
+        return 0
+    if not last_update or my_uid >= len(last_update) or rate_limit is None:
+        return 0
+    elapsed = current - int(last_update[my_uid])
+    if elapsed >= int(rate_limit):
+        return 0
+    return int(rate_limit) - elapsed
+
+
 def set_weights(sub, wallet, netuid, uids, vals) -> bool:
     try:
-        wvk = sub.substrate.query("SubtensorModule", "WeightsVersionKey", [netuid]).value
+        my_uid = sub.substrate.query(
+            "SubtensorModule", "Uids",
+            [netuid, wallet.hotkey.ss58_address]
+        ).value
     except Exception:
-        wvk = None
-    extra = {"version_key": wvk} if wvk is not None else {}
+        my_uid = None
+    if my_uid is not None:
+        wait = _within_rate_limit(sub, netuid, my_uid)
+        if wait > 0:
+            log.info(f"skip set_weights: chain rate-limit, "
+                     f"{wait} blocks remaining (~{wait * 12}s)")
+            return False
     for attempt in range(3):
+        # Re-query weights_version_key per attempt — chain rotates it under
+        # commit-reveal and a stale value gets the extrinsic rejected.
         try:
-            sub.set_weights(wallet=wallet, netuid=netuid, uids=uids, weights=vals,
-                            wait_for_inclusion=True, **extra)
-            log.info(f"set_weights ok: {len(uids)} uids (version_key={wvk})")
-            return True
+            wvk = sub.substrate.query("SubtensorModule", "WeightsVersionKey", [netuid]).value
+        except Exception:
+            wvk = None
+        extra = {"version_key": wvk} if wvk is not None else {}
+        try:
+            # bittensor 10.x set_weights handles commit-reveal automatically. Don't
+            # block on reveal execution — the reveal happens in a future epoch and
+            # we only need the commit phase to land THIS epoch. Without this flag
+            # the call hangs waiting for reveal, eventually times out as "not-ok"
+            # even though the commit succeeded.
+            resp = sub.set_weights(wallet=wallet, netuid=netuid, uids=uids, weights=vals,
+                                   wait_for_inclusion=True,
+                                   wait_for_revealed_execution=False,
+                                   **extra)
+            # bittensor 10.x returns a tuple (success, message) or an
+            # ExtrinsicResponse with .success when raise_error=False. Treat
+            # falsy and "success=False" both as failure.
+            ok = True
+            msg = ""
+            if isinstance(resp, tuple) and len(resp) >= 1:
+                ok, msg = bool(resp[0]), (str(resp[1]) if len(resp) > 1 else "")
+            elif hasattr(resp, "success"):
+                ok, msg = bool(resp.success), str(getattr(resp, "message", "") or "")
+            if ok:
+                log.info(f"set_weights ok: {len(uids)} uids (version_key={wvk}) {msg}")
+                return True
+            log.warning(f"set_weights attempt {attempt + 1} returned not-ok: {msg or resp}")
         except Exception as e:
-            log.error(f"set_weights attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                time.sleep(5)
+            log.error(f"set_weights attempt {attempt + 1} threw: {e}")
+        if attempt < 2:
+            time.sleep(5)
     log.error("set_weights FAILED after 3 attempts; epoch weights NOT on chain")
     return False
 
@@ -341,16 +399,67 @@ def set_last_tempo(tempo_index: int) -> None:
         log.warning(f"last_tempo save failed: {e}")
 
 
+def _preflight(cfg: dict) -> tuple[bt.Wallet, str]:
+    """Validate startup requirements. Exits with code 2 on misconfiguration so
+    the operator sees a clear error in journalctl instead of a cryptic stack
+    trace from systemd's restart loop."""
+    api_key = os.environ.get("CHUTES_API_KEY", "").strip()
+    if not api_key:
+        log.error("preflight: CHUTES_API_KEY missing or empty")
+        sys.exit(2)
+    if not cfg.get("wallet_name") or not cfg.get("hotkey"):
+        log.error("preflight: BT_WALLET_NAME and BT_HOTKEY must be set")
+        sys.exit(2)
+    try:
+        wallet = bt.Wallet(name=cfg["wallet_name"], hotkey=cfg["hotkey"])
+        # Force-load the hotkey from disk so a missing/corrupt key fails now,
+        # not 90 minutes later inside push_pending().
+        addr = wallet.hotkey.ss58_address
+    except Exception as e:
+        log.error(f"preflight: wallet load failed ({cfg['wallet_name']}/{cfg['hotkey']}): {e}")
+        sys.exit(2)
+    log.info(f"preflight ok: wallet={cfg['wallet_name']}/{cfg['hotkey']} ss58={addr}")
+    return wallet, api_key
+
+
+def _start_watchdog(last_progress: list) -> None:
+    """Kill the process if the main loop hasn't made progress in
+    WATCHDOG_TIMEOUT_SECONDS. Substrate calls have no socket-level timeout,
+    so a wedged Finney peer can block forever; systemd Restart=always then
+    gives us a fresh Subtensor connection."""
+    def _tick():
+        while True:
+            time.sleep(60)
+            stalled = time.time() - last_progress[0]
+            if stalled > WATCHDOG_TIMEOUT_SECONDS:
+                log.error(f"watchdog: no progress in {stalled:.0f}s, exiting for restart")
+                os._exit(3)
+    threading.Thread(target=_tick, daemon=True).start()
+
+
+def _heartbeat_sleep(last_progress: list, total_secs: float) -> None:
+    """Sleep total_secs while pulsing the watchdog every 60s."""
+    end = time.time() + total_secs
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        last_progress[0] = time.time()
+        time.sleep(min(60.0, remaining))
+
+
 def main():
     cfg = load_config()
-    api_key = os.environ["CHUTES_API_KEY"]
-    wallet = bt.Wallet(name=cfg["wallet_name"], hotkey=cfg["hotkey"])
+    wallet, api_key = _preflight(cfg)
     netuid = cfg["netuid"]
     llm = LLM(cfg["chutes_api_url"], api_key)
     elo = load_elo(
         default_k=cfg["old_config"]["elo"]["k_factor"],
         default_initial=cfg["old_config"]["elo"]["initial_rating"],
     )
+
+    last_progress = [time.time()]
+    _start_watchdog(last_progress)
 
     from compelle import FULL_VERSION
     log.info(f"compelle validator {FULL_VERSION} starting on netuid {netuid} ({cfg['network']})")
@@ -367,6 +476,7 @@ def main():
     last_sw_ts = None
 
     while True:
+        last_progress[0] = time.time()
         epoch += 1
         log.info(f"=== epoch {epoch} ===")
 
@@ -442,8 +552,11 @@ def main():
                                               epoch_start_block, elo=elo)
                 if results:
                     real_weights = elo.weights(cfg["elo"]["temperature"])
-                    save_elo(elo)
+                    # Mark tempo BEFORE saving Elo: a crash between the two writes
+                    # is preferable in this order — on restart we'd skip the
+                    # tournament (stale Elo) instead of double-counting matches.
                     set_last_tempo(current_tempo)
+                    save_elo(elo)
 
         real_weights = {hk: w for hk, w in real_weights.items()
                         if hk in records and records[hk].is_real}
@@ -455,6 +568,7 @@ def main():
         else:
             log.info("no weights to set this epoch")
             sw_status = "skipped"
+        last_progress[0] = time.time()  # set_weights / chain ops finished, watchdog should see it
         last_sw_block = epoch_start_block
         last_sw_status = sw_status
         last_sw_ts = time.time()
@@ -463,14 +577,22 @@ def main():
                     sw_status)
         prune_epochs(keep_epochs)
         push_pending(cfg["push_url"], wallet)
-        write_health(epoch, time.time(), epoch_start_block,
+        write_health(epoch, last_progress[0], epoch_start_block,
                      last_sw_block, last_sw_status, last_sw_ts)
 
-        sleep_secs = cfg["tournament"]["epoch_seconds"]
+        # On set_weights failure, retry within the same tempo by waking up
+        # quickly. The next iteration will see current_tempo <= last_tempo,
+        # skip the tournament, recompute weights from cached Elo, and retry
+        # the chain submission. Once the tempo rolls over those weights are
+        # gone, so a tight retry window is the only way to recover.
+        if sw_status == "failed":
+            sleep_secs = 60
+        else:
+            sleep_secs = cfg["tournament"]["epoch_seconds"]
         log.info(f"epoch {epoch} done; next in {sleep_secs}s")
         try: sub.close()
         except Exception as e: log.warning(f"subtensor close failed: {e}")
-        time.sleep(sleep_secs)
+        _heartbeat_sleep(last_progress, sleep_secs)
 
 
 if __name__ == "__main__":
