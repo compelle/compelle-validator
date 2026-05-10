@@ -569,8 +569,14 @@ def main():
                     set_last_tempo(current_tempo)
                     save_elo(elo)
 
+        # Drop hotkeys whose CURRENT commitment doesn't resolve, even if they
+        # carry stale Elo from earlier epochs. real_strategies (built above) is
+        # already filtered to non-empty resolutions, so it's the canonical set
+        # of "currently usable" miners. Without this guard, a miner that earned
+        # Elo under a previous (looser) regex keeps getting weight after their
+        # commitment is rejected.
         real_weights = {hk: w for hk, w in real_weights.items()
-                        if hk in records and records[hk].is_real}
+                        if hk in real_strategies}
         weights = assign_weights(records, real_weights, epoch_start_block)
         if weights and not real_weights:
             # Epsilon-only epoch: assign_weights returned EPS_BUDGET-tiny
