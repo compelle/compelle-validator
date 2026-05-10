@@ -380,6 +380,53 @@ def save_elo(elo) -> None:
         log.warning(f"elo save failed: {e}")
 
 
+def maybe_publish_chain_version(sub, wallet, netuid) -> None:
+    """Publish `vdata:version=<full_version>` to chain via pallet_commitments,
+    so any observer can see what code each validator hotkey is running — even
+    operators who don't push to our /ingest endpoint.
+
+    Idempotent: reads the current commitment first; only writes if different.
+    Refuses to overwrite a non-vdata commitment (e.g., if an operator's
+    validator hotkey is doubling as a miner with a strategy). Failures are
+    non-fatal — chain visibility is observability, not a hard requirement.
+    """
+    from compelle import FULL_VERSION
+    from compelle.eligibility import decode_commitment_info, VALIDATOR_DATA_PREFIX
+    target = f"{VALIDATOR_DATA_PREFIX}version={FULL_VERSION}"
+
+    current = ""
+    try:
+        raw = sub.substrate.query(
+            "Commitments", "CommitmentOf",
+            [netuid, wallet.hotkey.ss58_address],
+        )
+        if raw and raw.value:
+            current = (decode_commitment_info(raw.value.get("info") or {}) or "").strip()
+    except Exception as e:
+        log.warning(f"vdata version: read current commitment failed ({e}); will attempt set anyway")
+
+    if current == target:
+        log.info(f"on-chain validator version up to date: {target}")
+        return
+    if current and not current.startswith(VALIDATOR_DATA_PREFIX):
+        log.warning(
+            f"validator hotkey has a non-vdata commitment "
+            f"({current[:60]!r}...); refusing to overwrite"
+        )
+        return
+
+    log.info(f"publishing on-chain validator version: {target}")
+    try:
+        resp = sub.set_commitment(
+            wallet=wallet, netuid=netuid, data=target,
+            wait_for_inclusion=True, wait_for_finalization=False,
+        )
+        ok = bool(resp and getattr(resp, "success", False))
+        log.info(f"vdata:version publish {'ok' if ok else 'failed'}: {resp}")
+    except Exception as e:
+        log.warning(f"vdata:version publish error: {e}")
+
+
 def prune_stale_elo(elo, records) -> int:
     """Drop Elo entries whose hotkey is unreachable from this epoch's chain
     state. Two cuts, both safe:
@@ -510,6 +557,19 @@ def main():
 
     from compelle import FULL_VERSION
     log.info(f"compelle validator {FULL_VERSION} starting on netuid {netuid} ({cfg['network']})")
+
+    # One-shot version publish on chain. Fresh Subtensor (closed immediately)
+    # to avoid colliding with the per-epoch one. Non-fatal on failure.
+    try:
+        _vsub = bt.Subtensor(network=cfg["network"])
+        try:
+            maybe_publish_chain_version(_vsub, wallet, netuid)
+        finally:
+            try: _vsub.close()
+            except Exception: pass
+    except Exception as e:
+        log.warning(f"vdata version publish skipped (chain unreachable at startup): {e}")
+
     gist_id = cfg.get("config_gist_id", "")
     gist_owner = cfg.get("config_gist_owner", "")
     keep_epochs = int(cfg.get("keep_epochs", 1000))
