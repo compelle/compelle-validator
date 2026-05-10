@@ -127,6 +127,22 @@ echo "COMPELLE_TARGET_REF=origin/staging" | sudo tee /etc/compelle/watchtower.en
 sudo systemctl daemon-reload && sudo systemctl restart compelle-watchtower.timer
 ```
 
+To **harden against supply-chain attacks** (refuse anything except gpg-signed release tags):
+```bash
+# 1. Import the maintainer's public key. Verify the fingerprint
+#    out-of-band against multiple sources before trusting it.
+gpg --recv-keys <MAINTAINER_FINGERPRINT>
+
+# 2. Pin watchtower to a specific signed release tag and require signing
+sudo tee /etc/compelle/watchtower.env <<EOF
+COMPELLE_TARGET_REF=v0.2.0
+COMPELLE_REQUIRE_SIGNED=1
+EOF
+sudo systemctl daemon-reload && sudo systemctl restart compelle-watchtower.timer
+```
+
+With `COMPELLE_REQUIRE_SIGNED=1`, watchtower refuses any target that isn't an annotated tag with a verified gpg signature. You then upgrade by editing `COMPELLE_TARGET_REF=v0.2.1` after auditing each release. Pre-existing trust on the maintainer's key is the only thing that lets new code through.
+
 ## License
 
 MIT. See `LICENSE`.

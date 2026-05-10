@@ -59,6 +59,28 @@ if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$TARGET_REF")" ]; then
     exit 0
 fi
 
+# Optional supply-chain hardening. Set COMPELLE_REQUIRE_SIGNED=1 in
+# /etc/compelle/watchtower.env to refuse any target that is not a gpg-signed
+# annotated tag. Operators must first import the maintainer's public key
+# (the maintainer publishes their key fingerprint on multiple channels;
+# verify out-of-band before trust). With this set, watchtower will refuse
+# to deploy origin/main or any unsigned ref. Use COMPELLE_TARGET_REF=vX.Y.Z
+# (a specific signed release tag) alongside this flag.
+if [ "${COMPELLE_REQUIRE_SIGNED:-0}" = "1" ]; then
+    target_type=$(git cat-file -t "$TARGET_REF" 2>/dev/null || echo "unknown")
+    if [ "$target_type" != "tag" ]; then
+        echo "REFUSED (COMPELLE_REQUIRE_SIGNED=1): target $TARGET_REF is a $target_type, not an annotated tag"
+        echo "Set COMPELLE_TARGET_REF to a signed tag like v0.2.0, or unset COMPELLE_REQUIRE_SIGNED."
+        exit 1
+    fi
+    if ! git verify-tag "$TARGET_REF" 2>&1; then
+        echo "REFUSED (COMPELLE_REQUIRE_SIGNED=1): gpg signature on $TARGET_REF did not verify"
+        echo "Either the maintainer's key is not in your gpg keyring, or the tag is forged."
+        exit 1
+    fi
+    echo "  signed tag verified: $TARGET_REF"
+fi
+
 echo "=== reset to target (DESTRUCTIVE: any local changes will be lost) ==="
 if [ "$AUTO" = "1" ]; then
     echo "  --auto flag set; skipping confirmation"
