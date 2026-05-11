@@ -37,6 +37,17 @@
       "symbol": "Δ",
       "min_length": 50
     },
+    "intent_classifier": {
+      "enabled": true,
+      "models": [
+        "zai-org/GLM-5.1-TEE",
+        "deepseek-ai/DeepSeek-V3.2-TEE",
+        "moonshotai/Kimi-K2.6-TEE"
+      ],
+      "max_tokens": 8192,
+      "temperature": 0.1,
+      "parallel_workers": 6
+    },
     "topics": [
       {"motion": "God exists", "source": "evergreen"},
       {"motion": "Human beings possess genuine free will", "source": "evergreen"},

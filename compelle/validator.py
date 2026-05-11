@@ -15,6 +15,7 @@ import requests
 
 from compelle.engine import LLM, Elo, run_tournament, resolve_strategy, _GIST_REVISIONED_RE
 from compelle.eligibility import fetch_records, assign_weights
+from compelle.intent_classifier import classify_records
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -235,7 +236,13 @@ def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, 
         "miners": {
             hk: {
                 "uid": r.uid,
-                "tier": "real" if r.is_real else ("epsilon" if r.is_placeholder else "ineligible"),
+                "tier": (
+                    "real" if r.is_real_and_clean
+                    else "intent_locked" if (r.is_real and r.intent_verdict == "BAD")
+                    else "epsilon" if r.is_placeholder
+                    else "ineligible"
+                ),
+                "intent_verdict": r.intent_verdict,
                 "played": hk in played_set,
                 "elo": elo.ratings.get(hk),
                 "weight": weights.get(hk, 0.0),
@@ -679,16 +686,43 @@ def main():
         log.info(f"config: {which} ({len(cfg.get('topics', []))} topics, "
                  f"gist_revision={cached_revision[:8]})")
 
+        # Commit-time intent classifier — pluggable, feature-flagged via cfg.
+        intent_cfg = cfg.get("intent_classifier") or {}
+        if intent_cfg.get("enabled", True):
+            try:
+                intent_results = classify_records(
+                    records,
+                    llm=llm,
+                    resolve_fn=resolve_strategy,
+                    panel=intent_cfg.get("models"),
+                    max_tokens=int(intent_cfg.get("max_tokens", 8192)),
+                    temperature=float(intent_cfg.get("temperature", 0.1)),
+                    parallel_workers=int(intent_cfg.get("parallel_workers", 6)),
+                    thinking_tags=cfg.get("thinking_tags"),
+                )
+                for hk, res in intent_results.items():
+                    records[hk].intent_verdict = res.verdict
+                n_bad = sum(1 for r in records.values() if r.intent_verdict == "BAD")
+                n_good = sum(1 for r in records.values() if r.intent_verdict == "GOOD")
+                n_pending = sum(1 for r in records.values() if r.is_real and r.intent_verdict == "PENDING")
+                log.info(f"intent classifier: {n_good} good, {n_bad} bad, {n_pending} pending")
+                for hk, res in intent_results.items():
+                    if res.is_bad:
+                        log.warning(f"intent BAD: uid={records[hk].uid} hk={hk[:12]} reasons={[v.reason for v in res.votes]}")
+            except Exception as e:
+                log.warning(f"intent classifier failed at epoch level: {e}; treating all as PENDING")
+
         real_strategies = {
             hk: resolve_strategy(r.commitment_text)
-            for hk, r in records.items() if r.is_real
+            for hk, r in records.items() if r.is_real_and_clean
         }
         real_strategies = {hk: t for hk, t in real_strategies.items() if t.strip()}
 
         n_real = len(real_strategies)
         n_eps = sum(1 for r in records.values() if r.is_placeholder)
         n_zero = sum(1 for r in records.values() if not r.is_eligible)
-        log.info(f"miners: {n_real} real, {n_eps} epsilon, {n_zero} ineligible")
+        n_intent_locked = sum(1 for r in records.values() if r.is_real and r.intent_verdict == "BAD")
+        log.info(f"miners: {n_real} real, {n_eps} epsilon, {n_zero} ineligible, {n_intent_locked} intent-locked")
 
         # Idempotency: skip the tournament if we already completed THIS tempo.
         # Prevents double-applying Elo if the validator restarts mid-tempo.

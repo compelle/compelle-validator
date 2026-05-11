@@ -17,6 +17,10 @@ class MinerRecord:
     registration_block: int
     commitment_block: int
     commitment_text: str
+    # Set by compelle.intent_classifier.classify_records after the basic
+    # fetch_records pass. Values: "GOOD", "BAD", "PENDING". Default PENDING
+    # means classifier hasn't run yet (or is_real is False so it never will).
+    intent_verdict: str = "PENDING"
 
     @property
     def is_eligible(self) -> bool:
@@ -28,11 +32,25 @@ class MinerRecord:
 
     @property
     def is_real(self) -> bool:
+        """Real-miner basic criteria: eligible timing, non-epsilon, non-vdata.
+
+        Does NOT include intent classification — see `is_real_and_clean` for that.
+        Kept distinct so the classifier knows which records to evaluate.
+        """
         return (
             self.is_eligible
             and not self.is_placeholder
             and not self.commitment_text.strip().startswith(VALIDATOR_DATA_PREFIX)
         )
+
+    @property
+    def is_real_and_clean(self) -> bool:
+        """is_real AND intent classifier has not flagged the strategy as BAD.
+
+        PENDING is treated as clean (i.e., a transient classifier failure does
+        not lock out the miner — we retry next epoch).
+        """
+        return self.is_real and self.intent_verdict != "BAD"
 
 
 def decode_commitment_info(info) -> str:
