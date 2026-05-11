@@ -267,6 +267,41 @@ def _block_from_filename(name: str) -> int | None:
     return int(s) if s.isdigit() else None
 
 
+def push_startup_ping(push_url: str, wallet, block: int) -> None:
+    """At validator startup, push a tiny `kind=startup` payload to /ingest
+    so the backend can record `(hotkey, version, ts, block)` without waiting
+    for the next epoch's tournament-completion push. Non-blocking, swallows
+    all errors — version visibility is observability, not a hard requirement.
+    """
+    if not push_url or push_url.lower() in ("disabled", "off", "none"):
+        return
+    from compelle import FULL_VERSION
+    payload = {
+        "kind": "startup",
+        "validator_version": FULL_VERSION,
+        "ts": int(time.time()),
+        "epoch_block": int(block),
+    }
+    body = gzip.compress(json.dumps(payload).encode("utf-8"))
+    name = f"epoch_{int(block):010d}.json.gz"
+    try:
+        sig = wallet.hotkey.sign(hashlib.sha256(body).digest()).hex()
+        r = requests.post(push_url, data=body, headers={
+            "User-Agent": "compelle-validator/0.1",
+            "Content-Type": "application/gzip",
+            "X-Compelle-Hotkey": wallet.hotkey.ss58_address,
+            "X-Compelle-Signature": sig,
+            "X-Compelle-Filename": name,
+        }, timeout=10)
+    except Exception as e:
+        log.warning(f"startup ping exception (non-fatal): {e}")
+        return
+    if r.status_code >= 400:
+        log.warning(f"startup ping {name} -> {r.status_code}: {r.text[:200]}")
+        return
+    log.info(f"startup ping ok: version={FULL_VERSION} block={block}")
+
+
 def push_pending(push_url: str, wallet) -> None:
     if not push_url or push_url.lower() in ("disabled", "off", "none"):
         return
@@ -561,19 +596,25 @@ def main():
     from compelle import FULL_VERSION
     log.info(f"compelle validator {FULL_VERSION} starting on netuid {netuid} ({cfg['network']})")
 
-    # One-shot cleanup of leftover vdata: commitment from earlier releases.
-    # Version tracking now lives in per-epoch /ingest payloads; the chain
-    # commitment was an unwanted footprint. Fresh Subtensor (closed right
-    # away) so this doesn't tangle with the per-epoch one. Non-fatal.
+    # One-shot cleanup of leftover vdata: commitment from earlier releases,
+    # plus a startup ping to /ingest so the backend sees the new version
+    # within seconds rather than waiting for the next epoch's payload push.
+    # Fresh Subtensor (closed right away) so this doesn't tangle with the
+    # per-epoch one. All non-fatal.
     try:
         _vsub = bt.Subtensor(network=cfg["network"])
         try:
             maybe_publish_chain_version(_vsub, wallet, netuid)
+            try:
+                _block = int(_vsub.get_current_block())
+            except Exception:
+                _block = 0
+            push_startup_ping(cfg["push_url"], wallet, _block)
         finally:
             try: _vsub.close()
             except Exception: pass
     except Exception as e:
-        log.warning(f"vdata cleanup skipped (chain unreachable at startup): {e}")
+        log.warning(f"vdata cleanup / startup ping skipped (chain unreachable at startup): {e}")
 
     gist_id = cfg.get("config_gist_id", "")
     gist_owner = cfg.get("config_gist_owner", "")
