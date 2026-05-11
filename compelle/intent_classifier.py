@@ -303,6 +303,7 @@ def classify_records(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
     parallel_workers: int = DEFAULT_PARALLEL,
+    uid_parallel_workers: int = 6,
     thinking_tags: Optional[list[str]] = None,
 ) -> dict[str, IntentResult]:
     """Run classifier on every eligible non-placeholder miner record.
@@ -314,19 +315,32 @@ def classify_records(
     Returns {hotkey: IntentResult}. Records that are not real (epsilon, vdata,
     or outside the eligibility window) are skipped — they get no IntentResult.
 
-    Classification is sequential across miners to keep one validator's load
-    reasonable on the shared Chutes panel; per-strategy panel votes are
-    already parallelized inside classify_strategy.
+    Parallelism is two-level:
+      - uid_parallel_workers strategies are classified concurrently;
+      - parallel_workers (= 3 panel members in practice) votes happen
+        concurrently within each strategy.
+    Cache hits return immediately and don't consume a worker slot for long.
     """
     results: dict[str, IntentResult] = {}
+
+    # Pre-resolve and filter — pull the (hotkey, strategy_text) pairs we will
+    # actually classify. Cheap (gist fetches are cached) and lets us size the
+    # work pool to the number of real miners.
+    work: list[tuple[str, str]] = []
     for hk, r in records.items():
         if not r.is_real:
             continue
         strategy = resolve_fn(r.commitment_text)
         if not strategy or not strategy.strip():
             continue
+        work.append((hk, strategy))
+
+    if not work:
+        return results
+
+    def _classify_one(hk: str, strategy: str) -> tuple[str, IntentResult]:
         try:
-            results[hk] = classify_strategy(
+            res = classify_strategy(
                 strategy,
                 llm=llm,
                 panel=panel,
@@ -335,7 +349,15 @@ def classify_records(
                 parallel_workers=parallel_workers,
                 thinking_tags=thinking_tags,
             )
+            return hk, res
         except Exception as e:
-            log.warning(f"intent classification failed for uid={r.uid} hk={hk[:12]}: {e}")
-            results[hk] = IntentResult(verdict="PENDING", votes=[], cached=False)
+            log.warning(f"intent classification failed for uid={records[hk].uid} hk={hk[:12]}: {e}")
+            return hk, IntentResult(verdict="PENDING", votes=[], cached=False)
+
+    n_workers = max(1, min(uid_parallel_workers, len(work)))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = [ex.submit(_classify_one, hk, strategy) for hk, strategy in work]
+        for fut in as_completed(futures):
+            hk, res = fut.result()
+            results[hk] = res
     return results

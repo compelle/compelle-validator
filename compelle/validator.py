@@ -698,6 +698,7 @@ def main():
                     max_tokens=int(intent_cfg.get("max_tokens", 8192)),
                     temperature=float(intent_cfg.get("temperature", 0.1)),
                     parallel_workers=int(intent_cfg.get("parallel_workers", 6)),
+                    uid_parallel_workers=int(intent_cfg.get("uid_parallel_workers", 6)),
                     thinking_tags=cfg.get("thinking_tags"),
                 )
                 for hk, res in intent_results.items():
