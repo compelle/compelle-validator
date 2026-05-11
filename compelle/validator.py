@@ -381,50 +381,53 @@ def save_elo(elo) -> None:
 
 
 def maybe_publish_chain_version(sub, wallet, netuid) -> None:
-    """Publish `vdata:version=<full_version>` to chain via pallet_commitments,
-    so any observer can see what code each validator hotkey is running — even
-    operators who don't push to our /ingest endpoint.
+    """One-shot cleanup of any leftover `vdata:version=...` commitment from
+    earlier compelle-validator releases.
 
-    Idempotent: reads the current commitment first; only writes if different.
-    Refuses to overwrite a non-vdata commitment (e.g., if an operator's
-    validator hotkey is doubling as a miner with a strategy). Failures are
-    non-fatal — chain visibility is observability, not a hard requirement.
+    Version tracking moved to per-epoch payloads pushed to /ingest. The chain
+    commitment was an unilateral footprint on the operator's hotkey, costing
+    gas at every startup and labeling their hotkey as `compelle-validator
+    version X` on chain without their consent. We're walking that back.
+
+    This function reads the hotkey's current commitment. If it's a `vdata:`
+    prefix (placed by a previous release), it overwrites with empty data
+    to clear the chain trace. Any other commitment (a strategy, etc.) is
+    left untouched. Idempotent and non-fatal: failure to clear is logged
+    and ignored — the validator runs fine either way.
+
+    Will be removed entirely in a future release once enough operators have
+    pulled this cleanup version that no stale `vdata:` commitments remain.
     """
-    from compelle import FULL_VERSION
     from compelle.eligibility import decode_commitment_info, VALIDATOR_DATA_PREFIX
-    target = f"{VALIDATOR_DATA_PREFIX}version={FULL_VERSION}"
 
-    current = ""
     try:
         raw = sub.substrate.query(
             "Commitments", "CommitmentOf",
             [netuid, wallet.hotkey.ss58_address],
         )
-        if raw and raw.value:
-            current = (decode_commitment_info(raw.value.get("info") or {}) or "").strip()
     except Exception as e:
-        log.warning(f"vdata version: read current commitment failed ({e}); will attempt set anyway")
-
-    if current == target:
-        log.info(f"on-chain validator version up to date: {target}")
+        log.warning(f"vdata cleanup: read commitment failed ({e}); skipping")
         return
-    if current and not current.startswith(VALIDATOR_DATA_PREFIX):
-        log.warning(
-            f"validator hotkey has a non-vdata commitment "
-            f"({current[:60]!r}...); refusing to overwrite"
-        )
+    if not raw or not raw.value:
+        return
+    current = (decode_commitment_info(raw.value.get("info") or {}) or "").strip()
+    if not current:
+        return
+    if not current.startswith(VALIDATOR_DATA_PREFIX):
+        # Not ours — possibly a miner-style strategy on a dual-purpose
+        # hotkey, or another tool's data. Never touch.
         return
 
-    log.info(f"publishing on-chain validator version: {target}")
+    log.info(f"clearing leftover chain vdata commitment: {current[:80]!r}")
     try:
         resp = sub.set_commitment(
-            wallet=wallet, netuid=netuid, data=target,
+            wallet=wallet, netuid=netuid, data="",
             wait_for_inclusion=True, wait_for_finalization=False,
         )
         ok = bool(resp and getattr(resp, "success", False))
-        log.info(f"vdata:version publish {'ok' if ok else 'failed'}: {resp}")
+        log.info(f"vdata cleanup {'ok' if ok else 'failed'}: {resp}")
     except Exception as e:
-        log.warning(f"vdata:version publish error: {e}")
+        log.warning(f"vdata cleanup error (non-fatal): {e}")
 
 
 def prune_stale_elo(elo, records) -> int:
@@ -558,8 +561,10 @@ def main():
     from compelle import FULL_VERSION
     log.info(f"compelle validator {FULL_VERSION} starting on netuid {netuid} ({cfg['network']})")
 
-    # One-shot version publish on chain. Fresh Subtensor (closed immediately)
-    # to avoid colliding with the per-epoch one. Non-fatal on failure.
+    # One-shot cleanup of leftover vdata: commitment from earlier releases.
+    # Version tracking now lives in per-epoch /ingest payloads; the chain
+    # commitment was an unwanted footprint. Fresh Subtensor (closed right
+    # away) so this doesn't tangle with the per-epoch one. Non-fatal.
     try:
         _vsub = bt.Subtensor(network=cfg["network"])
         try:
@@ -568,7 +573,7 @@ def main():
             try: _vsub.close()
             except Exception: pass
     except Exception as e:
-        log.warning(f"vdata version publish skipped (chain unreachable at startup): {e}")
+        log.warning(f"vdata cleanup skipped (chain unreachable at startup): {e}")
 
     gist_id = cfg.get("config_gist_id", "")
     gist_owner = cfg.get("config_gist_owner", "")
