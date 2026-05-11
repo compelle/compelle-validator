@@ -269,21 +269,28 @@ def _block_from_filename(name: str) -> int | None:
 
 def push_startup_ping(push_url: str, wallet, block: int) -> None:
     """At validator startup, push a tiny `kind=startup` payload to /ingest
-    so the backend can record `(hotkey, version, ts, block)` without waiting
-    for the next epoch's tournament-completion push. Non-blocking, swallows
+    so the backend can record `(hotkey, version, ts)` without waiting for
+    the next epoch's tournament-completion push. Non-blocking, swallows
     all errors — version visibility is observability, not a hard requirement.
+
+    Filename uses unix_ts (10 digits) as the identifier rather than chain
+    block, to avoid R2-key collisions with regular per-tournament epoch
+    files (which use 7-8-digit chain blocks padded to 10). Same cf-worker
+    `epoch_\\d{10}.json.gz` regex accepts both; the indexer branches on
+    payload.kind to route into the right table.
     """
     if not push_url or push_url.lower() in ("disabled", "off", "none"):
         return
     from compelle import FULL_VERSION
+    now_ts = int(time.time())
     payload = {
         "kind": "startup",
         "validator_version": FULL_VERSION,
-        "ts": int(time.time()),
-        "epoch_block": int(block),
+        "ts": now_ts,
+        "epoch_block": int(block),    # chain block at startup, informational
     }
     body = gzip.compress(json.dumps(payload).encode("utf-8"))
-    name = f"epoch_{int(block):010d}.json.gz"
+    name = f"epoch_{now_ts:010d}.json.gz"
     try:
         sig = wallet.hotkey.sign(hashlib.sha256(body).digest()).hex()
         r = requests.post(push_url, data=body, headers={
