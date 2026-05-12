@@ -308,26 +308,39 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
 def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[str, str] | None:
     """Run a single judge model. Returns (verdict, reason) or None on failure.
 
-    Each panel member is queried with itself as primary and NO fallback — we
-    want OTHER panel members to vote, not for a single judge's failure to
-    cascade across the panel and pollute the diversity. Two attempts at
-    increasing temperature in case the model fails to produce a clean PRO/CON.
+    Each panel member is queried with itself as primary. The 2nd attempt
+    OPTIONALLY switches to `game.judge_fallback_model` if configured (e.g.,
+    a fast/lightly-loaded model like the debater primary), which helps when
+    Chutes is throttling a specific model's queue under burst load — the
+    fallback model has its own queue. Without `judge_fallback_model`, the
+    2nd attempt repeats the original model (legacy behavior).
+
+    Diversity rationale: even with the fallback firing, the panel still
+    receives one vote per panel slot; falling through to a single different
+    model is preferable to losing the vote entirely (which forces
+    single-judge fallback at the panel level).
     """
+    cfg = config.get("game", {})
     # Thinking-heavy models (Kimi, Qwen3-Thinking, DeepSeek) routinely burn
     # 2000+ reasoning tokens before producing visible output. A 2048 ceiling
     # truncates them mid-`<think>` block with no PRO/CON line. Match the
     # intent_classifier ceiling so the panel has consistent headroom.
-    judge_max_tokens = int(config.get("game", {}).get("judge_max_tokens", 8192))
+    judge_max_tokens = int(cfg.get("judge_max_tokens", 8192))
+    fallback_model = cfg.get("judge_fallback_model") or None
     for attempt in range(2):
+        # On attempt 2, switch to the configured fallback model if any.
+        # This sidesteps per-model Chutes throttling without losing the vote.
+        model_to_use = judge_model if attempt == 0 else (fallback_model or judge_model)
         try:
             verdict = llm.chat(
                 "You are an impartial debate judge. You MUST pick a winner. "
                 "Respond with exactly PRO or CON on the first line.",
                 [{"role": "user", "content": prompt}],
-                judge_model, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
+                model_to_use, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
             )
         except Exception as e:
-            log.warning("judge %s attempt %d failed: %s", judge_model, attempt + 1, str(e)[:80])
+            log.warning("judge %s attempt %d (model=%s) failed: %s",
+                        judge_model, attempt + 1, model_to_use, str(e)[:80])
             if attempt == 1:
                 return None
             continue

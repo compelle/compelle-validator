@@ -19,6 +19,7 @@
         "moonshotai/Kimi-K2.6-TEE"
       ],
       "judge_max_tokens": 8192,
+      "judge_fallback_model": "zai-org/GLM-5.1-TEE",
       "max_turns": 5,
       "max_tokens_per_turn": 3072,
       "temperature": 0.6,
@@ -26,7 +27,7 @@
     },
     "tournament": {
       "epoch_seconds": 4320,
-      "max_concurrent_games": 10
+      "max_concurrent_games": 20
     },
     "elo": {
       "k_factor": 32.0,
