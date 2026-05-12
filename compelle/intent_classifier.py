@@ -233,9 +233,15 @@ def classify_strategy(
     Rules:
       - Cached unanimous results return immediately (cached=True).
       - Non-cached strategies are sent to the panel in parallel.
-      - A strategy is BAD only if all valid votes are BAD AND at least 2 valid votes exist.
-      - A strategy is GOOD only if all valid votes are GOOD AND at least 2 valid votes exist.
+      - A strategy is BAD only if EVERY panel member voted AND every vote is BAD.
+      - A strategy is GOOD only if EVERY panel member voted AND every vote is GOOD.
       - Otherwise PENDING (retry next epoch; not cached).
+
+    "Strict unanimous" semantics: any missing vote (timeout, API error, model
+    refusal) downgrades the outcome to PENDING, not just the unrepresented
+    votes. This is the conservative choice for both directions, but matters
+    most for BAD — a lockout zeroes a miner's weight, so we want the full
+    panel on record before doing it.
 
     Empty strategies return GOOD without consulting the panel.
     """
@@ -269,16 +275,20 @@ def classify_strategy(
             except Exception as e:
                 votes[i] = PanelVote(model=panel[i], verdict=None, reason=f"err: {str(e)[:80]}", raw_chars=0)
 
-    # Decide
+    # Decide. Strict-unanimous: every panel member must have produced a valid
+    # vote AND every vote must agree. Anything less is PENDING and gets retried
+    # next epoch (and is NOT cached, so a transient timeout doesn't lock the
+    # strategy into a permanent verdict). 2-of-3 splits and 2-of-3-with-1-error
+    # both fall to PENDING under this rule.
     valid = [v for v in votes if v is not None and v.verdict in ("GOOD", "BAD")]
     bad = [v for v in valid if v.verdict == "BAD"]
     good = [v for v in valid if v.verdict == "GOOD"]
 
-    if len(valid) < 2:
+    if len(valid) < len(panel):
         verdict = "PENDING"
-    elif len(bad) == len(valid):
+    elif len(bad) == len(panel):
         verdict = "BAD"
-    elif len(good) == len(valid):
+    elif len(good) == len(panel):
         verdict = "GOOD"
     else:
         verdict = "PENDING"
