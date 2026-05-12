@@ -307,7 +307,7 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
             except Exception as e:
                 return _mk("draw", f"LLM error: {e}")
             visible = strip_thinking(raw, tags)
-            transcript.append({"speaker": side, "text": raw})
+            transcript.append({"speaker": side, "text": visible})
             histories[side].append({"role": "assistant", "content": visible})
             histories[opp].append({"role": "user", "content": visible})
             v = visible.strip()
