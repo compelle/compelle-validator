@@ -16,8 +16,9 @@
       "judge_panel": [
         "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE",
-        "MiniMaxAI/MiniMax-M2.5-TEE"
+        "moonshotai/Kimi-K2.6-TEE"
       ],
+      "judge_max_tokens": 8192,
       "max_turns": 5,
       "max_tokens_per_turn": 3072,
       "temperature": 0.6,
@@ -41,7 +42,7 @@
       "enabled": true,
       "models": [
         "zai-org/GLM-5.1-TEE",
-        "deepseek-ai/DeepSeek-V3.2-TEE",
+        "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE",
         "moonshotai/Kimi-K2.6-TEE"
       ],
       "max_tokens": 8192,

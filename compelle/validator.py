@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 import bittensor as bt
 import requests
 
-from compelle.engine import LLM, Elo, run_tournament, resolve_strategy, _GIST_REVISIONED_RE
+from compelle.engine import (
+    LLM, Elo, run_tournament, resolve_strategy, _GIST_REVISIONED_RE,
+    parse_quota_reset,
+)
 from compelle.eligibility import fetch_records, assign_weights
 from compelle.intent_classifier import classify_records
 
@@ -382,7 +385,8 @@ def _count_pending_pushes() -> int:
 
 
 def write_health(epoch: int, last_progress_ts: float, current_block: int,
-                 last_sw_block, last_sw_status, last_sw_ts) -> None:
+                 last_sw_block, last_sw_status, last_sw_ts,
+                 chutes_quota_reset_at=None) -> None:
     """Atomically write a snapshot of validator state for operator monitoring.
 
     Strictly local file. No HTTP, no network. Operators can `cat
@@ -403,7 +407,7 @@ def write_health(epoch: int, last_progress_ts: float, current_block: int,
             "last_set_weights_status": last_sw_status,
             "last_set_weights_at": int(last_sw_ts) if last_sw_ts else None,
             "pending_pushes": _count_pending_pushes(),
-            "chutes_quota_reset_at": None,
+            "chutes_quota_reset_at": chutes_quota_reset_at,
         }
         tmp = HEALTH_PATH + ".tmp"
         with open(tmp, "w") as f:
@@ -427,56 +431,6 @@ def save_elo(elo) -> None:
         os.replace(tmp, ELO_STATE_PATH)
     except Exception as e:
         log.warning(f"elo save failed: {e}")
-
-
-def maybe_publish_chain_version(sub, wallet, netuid) -> None:
-    """One-shot cleanup of any leftover `vdata:version=...` commitment from
-    earlier compelle-validator releases.
-
-    Version tracking moved to per-epoch payloads pushed to /ingest. The chain
-    commitment was an unilateral footprint on the operator's hotkey, costing
-    gas at every startup and labeling their hotkey as `compelle-validator
-    version X` on chain without their consent. We're walking that back.
-
-    This function reads the hotkey's current commitment. If it's a `vdata:`
-    prefix (placed by a previous release), it overwrites with empty data
-    to clear the chain trace. Any other commitment (a strategy, etc.) is
-    left untouched. Idempotent and non-fatal: failure to clear is logged
-    and ignored — the validator runs fine either way.
-
-    Will be removed entirely in a future release once enough operators have
-    pulled this cleanup version that no stale `vdata:` commitments remain.
-    """
-    from compelle.eligibility import decode_commitment_info, VALIDATOR_DATA_PREFIX
-
-    try:
-        raw = sub.substrate.query(
-            "Commitments", "CommitmentOf",
-            [netuid, wallet.hotkey.ss58_address],
-        )
-    except Exception as e:
-        log.warning(f"vdata cleanup: read commitment failed ({e}); skipping")
-        return
-    if not raw or not raw.value:
-        return
-    current = (decode_commitment_info(raw.value.get("info") or {}) or "").strip()
-    if not current:
-        return
-    if not current.startswith(VALIDATOR_DATA_PREFIX):
-        # Not ours — possibly a miner-style strategy on a dual-purpose
-        # hotkey, or another tool's data. Never touch.
-        return
-
-    log.info(f"clearing leftover chain vdata commitment: {current[:80]!r}")
-    try:
-        resp = sub.set_commitment(
-            wallet=wallet, netuid=netuid, data="",
-            wait_for_inclusion=True, wait_for_finalization=False,
-        )
-        ok = bool(resp and getattr(resp, "success", False))
-        log.info(f"vdata cleanup {'ok' if ok else 'failed'}: {resp}")
-    except Exception as e:
-        log.warning(f"vdata cleanup error (non-fatal): {e}")
 
 
 def prune_stale_elo(elo, records) -> int:
@@ -610,15 +564,12 @@ def main():
     from compelle import FULL_VERSION
     log.info(f"compelle validator {FULL_VERSION} starting on netuid {netuid} ({cfg['network']})")
 
-    # One-shot cleanup of leftover vdata: commitment from earlier releases,
-    # plus a startup ping to /ingest so the backend sees the new version
-    # within seconds rather than waiting for the next epoch's payload push.
-    # Fresh Subtensor (closed right away) so this doesn't tangle with the
-    # per-epoch one. All non-fatal.
+    # Startup ping to /ingest so the backend sees the new version within seconds
+    # rather than waiting for the next epoch's payload push. Fresh Subtensor
+    # (closed right away) so this doesn't tangle with the per-epoch one. Non-fatal.
     try:
         _vsub = bt.Subtensor(network=cfg["network"])
         try:
-            maybe_publish_chain_version(_vsub, wallet, netuid)
             try:
                 _block = int(_vsub.get_current_block())
             except Exception:
@@ -628,7 +579,7 @@ def main():
             try: _vsub.close()
             except Exception: pass
     except Exception as e:
-        log.warning(f"vdata cleanup / startup ping skipped (chain unreachable at startup): {e}")
+        log.warning(f"startup ping skipped (chain unreachable at startup): {e}")
 
     gist_id = cfg.get("config_gist_id", "")
     gist_owner = cfg.get("config_gist_owner", "")
@@ -641,6 +592,10 @@ def main():
     last_sw_block = None
     last_sw_status = None
     last_sw_ts = None
+    # Most recent Chutes 402 reset timestamp (ISO string) — populated when the
+    # epoch preflight detects quota exhaustion; surfaces in health.json so
+    # operators can see "next inference window opens at..." without log scraping.
+    last_chutes_quota_reset_at = None
 
     while True:
         last_progress[0] = time.time()
@@ -742,6 +697,13 @@ def main():
             ok, err = llm.ping(cfg["game"]["model"])
             if not ok:
                 log.warning(f"LLM preflight failed: {err[:200]}")
+                # Surface Chutes 402 quota reset timestamps in health.json so the
+                # operator sees when inference resumes. We don't sleep here —
+                # the next epoch loop will naturally re-preflight.
+                reset_iso = parse_quota_reset(err) if "402" in err else None
+                if reset_iso:
+                    last_chutes_quota_reset_at = reset_iso
+                    log.error(f"Chutes quota exhausted; reset_at={reset_iso}")
             else:
                 results, elo = run_tournament(
                     llm, cfg, real_strategies, epoch_start_block, elo=elo,
@@ -796,7 +758,8 @@ def main():
         prune_epochs(keep_epochs)
         push_pending(cfg["push_url"], wallet)
         write_health(epoch, last_progress[0], epoch_start_block,
-                     last_sw_block, last_sw_status, last_sw_ts)
+                     last_sw_block, last_sw_status, last_sw_ts,
+                     chutes_quota_reset_at=last_chutes_quota_reset_at)
 
         # On set_weights failure, retry within the same tempo by waking up
         # quickly. The next iteration will see current_tempo <= last_tempo,

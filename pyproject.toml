@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Reference validator for the Compelle subnet (Bittensor SN82)"
 requires-python = ">=3.12"
 dependencies = [
-    "bittensor>=10.1,<11",
+    "bittensor>=10.3,<11",
     "openai>=2.26,<3",
     "requests>=2.32,<3",
 ]

@@ -28,6 +28,12 @@ def topic_id(topic_obj: dict) -> str:
 
 _NOT_FOUND_MARKERS = ("404", "no_such_model", "model_not_found", "model not found",
                       "model does not exist", "unknown model")
+# Substrings that indicate a transient upstream condition worth retrying. Shared
+# by LLM.chat (same-model retry with backoff) and _chat (fallback to next model
+# after exhausting retries). 429 = rate limit, 5xx = upstream outage, "timeout"
+# catches bare httpx.ReadTimeout strings that don't carry an HTTP status.
+_TRANSIENT_MARKERS = ("429", "503", "502", "504", "rate limit", "overloaded",
+                      "service unavailable", "timeout")
 _VERDICT_WORDS = {
     "PRO": "Pro", "PROPOSITION": "Pro", "PROP": "Pro", "YES": "Pro", "AFFIRMATIVE": "Pro",
     "CON": "Con", "OPPOSITION": "Con", "OPP": "Con", "NO": "Con", "NEGATIVE": "Con",
@@ -37,6 +43,24 @@ _VERDICT_WORDS = {
 
 class ModelNotAvailableError(Exception):
     pass
+
+
+def parse_quota_reset(reason_str: str) -> str | None:
+    """Extract the ISO `quota_reset_timestamp` from a Chutes 402 error.
+
+    Chutes 402 responses include a `quota_reset_timestamp` field; on hit, return
+    the ISO string so the caller can decide how long to wait. Returns None if
+    the input isn't a 402 quota error or the timestamp can't be located.
+    """
+    if not reason_str or "quota_reset_timestamp" not in reason_str:
+        return None
+    idx = reason_str.find("quota_reset_timestamp")
+    tail = reason_str[idx:idx + 120]
+    q1 = tail.find("'", tail.find(":") + 1)
+    q2 = tail.find("'", q1 + 1) if q1 >= 0 else -1
+    if q1 >= 0 and q2 > q1:
+        return tail[q1 + 1:q2]
+    return None
 
 
 class LLM:
@@ -66,7 +90,7 @@ class LLM:
                 s = str(e).lower()
                 if any(m in s for m in _NOT_FOUND_MARKERS):
                     raise ModelNotAvailableError(str(e)) from e
-                if ("429" in s or "503" in s) and attempt < 7:
+                if any(m in s for m in _TRANSIENT_MARKERS) and attempt < 7:
                     time.sleep(min(2 ** attempt + random.random(), 60))
                     continue
                 raise
@@ -206,9 +230,7 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
             last = e
         except Exception as e:
             s = str(e).lower()
-            transient = any(c in s for c in ("429", "503", "502", "504",
-                                              "rate limit", "overloaded",
-                                              "service unavailable", "timeout"))
+            transient = any(c in s for c in _TRANSIENT_MARKERS)
             if transient and m != models[-1]:
                 log.warning("model %s transient error (%s), falling back", m, s[:80])
                 last = e
@@ -276,13 +298,18 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
     cascade across the panel and pollute the diversity. Two attempts at
     increasing temperature in case the model fails to produce a clean PRO/CON.
     """
+    # Thinking-heavy models (Kimi, Qwen3-Thinking, DeepSeek) routinely burn
+    # 2000+ reasoning tokens before producing visible output. A 2048 ceiling
+    # truncates them mid-`<think>` block with no PRO/CON line. Match the
+    # intent_classifier ceiling so the panel has consistent headroom.
+    judge_max_tokens = int(config.get("game", {}).get("judge_max_tokens", 8192))
     for attempt in range(2):
         try:
             verdict = llm.chat(
                 "You are an impartial debate judge. You MUST pick a winner. "
                 "Respond with exactly PRO or CON on the first line.",
                 [{"role": "user", "content": prompt}],
-                judge_model, max_tokens=2048, temperature=0.3 + attempt * 0.2,
+                judge_model, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
             )
         except Exception as e:
             log.warning("judge %s attempt %d failed: %s", judge_model, attempt + 1, str(e)[:80])
@@ -318,6 +345,9 @@ def _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
     tags = config.get("thinking_tags") or ["think"]
     primary = cfg.get("judge_model", cfg["model"])
     fallbacks = cfg.get("judge_model_fallbacks", cfg.get("model_fallbacks", []))
+    # Same ceiling as the panel path — debater/judge models share lineage and
+    # thinking budgets, so the single-judge fallback needs equal headroom.
+    judge_max_tokens = int(cfg.get("judge_max_tokens", 8192))
     for attempt in range(3):
         try:
             verdict = _chat(
@@ -325,7 +355,7 @@ def _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
                 "You are an impartial debate judge. You MUST pick a winner. "
                 "Respond with exactly PRO or CON on the first line.",
                 [{"role": "user", "content": prompt}],
-                primary, fallbacks, max_tok=2048, temp=0.3 + attempt * 0.2,
+                primary, fallbacks, max_tok=judge_max_tokens, temp=0.3 + attempt * 0.2,
             )
         except Exception as e:
             if attempt == 2:

@@ -79,9 +79,16 @@ def decode_commitment_info(info) -> str:
         for key, value in variant.items():
             if not (key.startswith("Raw") or key == "BigRaw"):
                 continue
-            # Unwrap nested-list-of-bytes shape: [[byte, byte, ...]]
-            if isinstance(value, (list, tuple)) and len(value) == 1 and \
-               isinstance(value[0], (list, tuple)):
+            # Compat: bittensor 10.3 returns BigRaw payloads as triple-nested
+            # tuples `(((b1, b2, ...),),)`, while 10.1/10.2 returns the older
+            # `[[byte, byte, ...]]`. Loop the unwrap as long as we have a
+            # single-element sequence whose only element is another sequence
+            # (and not a string/bytes leaf). The supported version is pinned
+            # in pyproject.toml; this loop is belt-and-suspenders so a future
+            # version bump can't silently regress the lookup.
+            while (isinstance(value, (list, tuple)) and len(value) == 1
+                   and isinstance(value[0], (list, tuple))
+                   and not isinstance(value[0], (str, bytes, bytearray))):
                 value = value[0]
             # String form. Two cases:
             #  - Raw{N} hex string: "0x657073696c6f6e" → hex-decode then utf-8
@@ -98,11 +105,41 @@ def decode_commitment_info(info) -> str:
                 return bytes(value).decode("utf-8", errors="replace")
             # Iterable of ints
             if isinstance(value, (list, tuple)):
-                return bytes(value).decode("utf-8", errors="replace")
+                try:
+                    return bytes(value).decode("utf-8", errors="replace")
+                except (TypeError, ValueError):
+                    return ""
             return ""
     except (KeyError, TypeError, IndexError, ValueError, AttributeError):
         pass
     return ""
+
+
+def _storage_key_to_ss58(subtensor: bt.Subtensor, storage_key) -> str | None:
+    """Coerce a Commitments::CommitmentOf storage key to an ss58 string.
+
+    Compat: bittensor 10.3 returns the storage_key as an ss58 string directly
+    (which is what the validator runs on). 10.1/10.2 returned it as a raw
+    32-byte tuple keyed by the public key — `str(storage_key)` then produced
+    `"(46, 174, ...)"` which never matched any metagraph hotkey, silently
+    zeroing out every commitment lookup. We pin to 10.3+ in pyproject.toml,
+    but keep this helper so a fresh venv that lands on the older line still
+    functions instead of failing silently.
+
+    Returns None for shapes we can't decode (caller skips them).
+    """
+    skv = storage_key.value if hasattr(storage_key, "value") else storage_key
+    if isinstance(skv, str):
+        return skv
+    if isinstance(skv, (tuple, list)):
+        # One level of unwrap if the pubkey bytes are nested
+        if len(skv) == 1 and isinstance(skv[0], (tuple, list)):
+            skv = skv[0]
+        try:
+            return subtensor.substrate.ss58_encode(bytes(skv))
+        except Exception:
+            return None
+    return None
 
 
 def fetch_records(
@@ -118,7 +155,9 @@ def fetch_records(
     )
     commitments: dict[str, tuple[int, str]] = {}
     for storage_key, value in raw:
-        hotkey = storage_key.value if hasattr(storage_key, "value") else str(storage_key)
+        hotkey = _storage_key_to_ss58(subtensor, storage_key)
+        if hotkey is None:
+            continue
         v = value.value if hasattr(value, "value") else value
         try:
             commitments[hotkey] = (int(v["block"]), decode_commitment_info(v.get("info")))
