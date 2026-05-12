@@ -269,6 +269,143 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
     raise last  # type: ignore[misc]
 
 
+def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
+                         on_progress=None, on_game_turn=None):
+    """Play one Swiss round with cross-game turn-batching.
+
+    Instead of N independent per-game turn loops (one slow turn stalls the
+    whole game serially), we fire all Pro turn-1 calls across active games
+    as one wave, then all Con turn-1, then Pro turn-2, etc. A slow call only
+    blocks its own wave, not other games' progression. The per-wave thread
+    pool uses `workers` for concurrency. Concessions short-circuit one pair
+    without affecting others; unfinished pairs are judged in parallel after
+    the final wave.
+
+    on_game_turn(idx, pair, side, text, transcript, conceded) is an optional
+    per-turn hook (e.g., for live-state UIs). on_progress() is pulsed after
+    each wave so the systemd watchdog stays fed.
+    """
+    cfg = config["game"]
+    motion = topic_obj["motion"]
+    ctx_text = topic_obj.get("context", "")
+    context = f"\nBackground context: {ctx_text}\n" if ctx_text else ""
+    today = datetime.now().strftime("%B %d, %Y")
+    template = config["game_prompt"]
+    fallbacks = cfg.get("model_fallbacks", [])
+    max_tok, temp = cfg["max_tokens_per_turn"], cfg["temperature"]
+    max_turns = cfg["max_turns"]
+    tags = config.get("thinking_tags") or ["think"]
+    sym = config["concession"]["symbol"]
+    min_len = config["concession"]["min_length"]
+    allow_draws = cfg.get("allow_draws", False)
+    tid = topic_id(topic_obj)
+
+    n = len(pairs)
+    prompts: dict[tuple[int, str], str] = {}
+    histories: dict[tuple[int, str], list] = {}
+    transcripts: list[list[dict]] = [[] for _ in range(n)]
+    start_times: list[float] = [time.time()] * n
+    outcomes: list[tuple[str, str] | None] = [None] * n  # (winner, reason) once decided
+
+    for idx, (pro, con) in enumerate(pairs):
+        prompts[(idx, "Pro")] = template.format(
+            topic=motion, side="Pro (in favor of the motion)",
+            strategy=strategies[pro], context=context, date=today)
+        prompts[(idx, "Con")] = template.format(
+            topic=motion, side="Con (opposed to the motion)",
+            strategy=strategies[con], context=context, date=today)
+        histories[(idx, "Pro")] = []
+        histories[(idx, "Con")] = []
+
+    for wave in range(max_turns * 2):
+        side = "Pro" if wave % 2 == 0 else "Con"
+        opp = "Con" if side == "Pro" else "Pro"
+        active = [i for i in range(n) if outcomes[i] is None]
+        if not active:
+            break
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futs = {pool.submit(_chat, llm, prompts[(i, side)],
+                                histories[(i, side)], cfg["model"],
+                                fallbacks, max_tok, temp): i
+                    for i in active}
+            for fut in as_completed(futs):
+                i = futs[fut]
+                try:
+                    raw = fut.result()
+                except Exception as e:
+                    outcomes[i] = ("draw", f"LLM error: {e}")
+                    if on_game_turn is not None:
+                        try:
+                            on_game_turn(idx=i, pair=pairs[i], side=side,
+                                         text="", transcript=transcripts[i],
+                                         conceded=True)
+                        except Exception as ce:
+                            log.warning(f"on_game_turn callback failed: {ce}")
+                    continue
+                visible = strip_thinking(raw, tags)
+                transcripts[i].append({"speaker": side, "text": visible})
+                histories[(i, side)].append({"role": "assistant", "content": visible})
+                histories[(i, opp)].append({"role": "user", "content": visible})
+                v = visible.strip()
+                if v.startswith(sym) and len(v) >= min_len:
+                    outcomes[i] = (opp, f"{side} conceded")
+                if on_game_turn is not None:
+                    try:
+                        on_game_turn(idx=i, pair=pairs[i], side=side,
+                                     text=visible, transcript=transcripts[i],
+                                     conceded=(outcomes[i] is not None))
+                    except Exception as ce:
+                        log.warning(f"on_game_turn callback failed: {ce}")
+        if on_progress is not None:
+            try:
+                on_progress()
+            except Exception as e:
+                log.warning(f"on_progress callback failed: {e}")
+
+    to_judge = [i for i in range(n) if outcomes[i] is None]
+    judge_results: dict[int, GameResult] = {}
+    if to_judge and allow_draws:
+        for i in to_judge:
+            outcomes[i] = ("draw", "Max turns reached")
+    elif to_judge:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futs = {pool.submit(judge_game, llm, config, topic_obj, motion,
+                                transcripts[i],
+                                time.time() - start_times[i]): i
+                    for i in to_judge}
+            for fut in as_completed(futs):
+                i = futs[fut]
+                try:
+                    judge_results[i] = fut.result()
+                except Exception as e:
+                    outcomes[i] = ("draw", f"Judge error: {e}")
+        if on_progress is not None:
+            try:
+                on_progress()
+            except Exception as e:
+                log.warning(f"on_progress callback failed: {e}")
+
+    out: list[tuple[int, str, str, GameResult]] = []
+    for i, (pro, con) in enumerate(pairs):
+        if i in judge_results:
+            gr = judge_results[i]
+            if not gr.topic_id:
+                gr.topic_id = tid
+            if not gr.topic_data:
+                gr.topic_data = topic_obj
+        else:
+            winner, reason = outcomes[i] or ("draw", "unknown")
+            gr = GameResult(
+                topic=motion, winner=winner, reason=reason,
+                turns=len(transcripts[i]), transcript=transcripts[i],
+                duration=time.time() - start_times[i],
+                topic_data=topic_obj, topic_id=tid,
+            )
+        gr.completed_at = datetime.now(timezone.utc).isoformat()
+        out.append((i, pro, con, gr))
+    return out
+
+
 def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
     cfg = config["game"]
     motion = topic_obj["motion"]
@@ -613,7 +750,7 @@ def _swiss_pair_round(hotkeys, scores, color_diff, played, elo, round_num,
 
 
 def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
-                   on_progress=None):
+                   on_progress=None, on_game_turn=None):
     hotkeys = list(strategies.keys())
     if len(hotkeys) < 2:
         return [], elo or Elo()
@@ -667,30 +804,15 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
                      f"con_cd={color_diff[con]:+d} pro_elo={elo.get(pro):.1f} "
                      f"con_elo={elo.get(con):.1f}")
         log.info(f"swiss R{round_num}/{num_rounds}: {len(pairs)} games")
-        games = list(enumerate((pair, chosen_topic) for pair in pairs))
 
-        def _play(item):
-            idx, ((pro, con), topic) = item
-            result = play_game(llm, config, topic, strategies[pro], strategies[con])
-            result.completed_at = datetime.now(timezone.utc).isoformat()
-            return idx, pro, con, result
-
-        completed: list[tuple[int, str, str, GameResult]] = []
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for fut in as_completed({pool.submit(_play, g): g for g in games}):
-                try:
-                    completed.append(fut.result())
-                except Exception as e:
-                    log.error(f"game error: {e}")
-                # Pulse the watchdog after each game (success or failure).
-                # Without this, large tournaments can exceed the watchdog
-                # timeout even while making steady progress, causing systemd
-                # to kill+restart mid-tournament and lose completed games.
-                if on_progress is not None:
-                    try:
-                        on_progress()
-                    except Exception as e:
-                        log.warning(f"on_progress callback failed: {e}")
+        # Lockstep round: all games advance turn-by-turn in cross-game waves
+        # so one slow LLM call blocks only its own wave, not the slowest
+        # game's whole 10-turn arc. on_progress is pulsed per wave to keep
+        # the systemd watchdog fed during long rounds.
+        completed = _play_round_lockstep(
+            llm, config, pairs, chosen_topic, strategies, workers,
+            on_progress=on_progress, on_game_turn=on_game_turn,
+        )
 
         completed.sort(key=lambda x: x[0])
         for _, pro, con, result in completed:
