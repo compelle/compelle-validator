@@ -70,7 +70,12 @@ def parse_quota_reset(reason_str: str) -> str | None:
 
 
 class LLM:
-    def __init__(self, base_url: str, api_key: str, timeout: float = 120.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
+        # 60s ReadTimeout matches healthy Chutes per-call latency (typically
+        # 1-30s, even for thinking models). Models that exceed 60s here are
+        # almost certainly stuck in a queue, not making progress — better to
+        # bail and let _judge_one's fallback model take over than to hold the
+        # game's critical path for 120s+ on a stalled call.
         self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
     def ping(self, model: str) -> tuple[bool, str]:
