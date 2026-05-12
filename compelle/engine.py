@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
+import httpx
 import requests
 from openai import OpenAI
 
@@ -71,12 +72,21 @@ def parse_quota_reset(reason_str: str) -> str | None:
 
 class LLM:
     def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
-        # 60s ReadTimeout matches healthy Chutes per-call latency (typically
-        # 1-30s, even for thinking models). Models that exceed 60s here are
-        # almost certainly stuck in a queue, not making progress — better to
-        # bail and let _judge_one's fallback model take over than to hold the
-        # game's critical path for 120s+ on a stalled call.
-        self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        # HTTP/2 multiplexes many concurrent requests over a small TCP pool,
+        # which Chutes' per-IP throttle counts as fewer connections than
+        # one-socket-per-request HTTP/1.1. Per-phase timeouts let us bail
+        # quickly on stuck pool/connect/write while still giving Chutes 45s
+        # to start streaming a thinking-model response. max_retries=0 disables
+        # the OpenAI SDK's sub-second retry storm so LLM.chat's exponential
+        # backoff is the only retry policy in play.
+        http = httpx.Client(
+            http2=True,
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=200,
+                                keepalive_expiry=30.0),
+            timeout=httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0),
+        )
+        self.client = OpenAI(base_url=base_url, api_key=api_key,
+                             http_client=http, max_retries=0)
 
     def ping(self, model: str) -> tuple[bool, str]:
         try:
