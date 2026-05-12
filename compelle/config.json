@@ -48,7 +48,7 @@
       "max_tokens": 8192,
       "temperature": 0.1,
       "parallel_workers": 3,
-      "uid_parallel_workers": 2
+      "uid_parallel_workers": 1
     },
     "topics": [
       {"motion": "God exists", "source": "evergreen"},
