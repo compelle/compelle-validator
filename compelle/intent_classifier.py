@@ -256,11 +256,23 @@ def classify_strategy(
     cache_key = _hash(strategy)
     if cache_key in _cache:
         e = _cache[cache_key]
-        votes = [
-            PanelVote(model=m, verdict=e["verdict"], reason=e.get("reasons", [""] * len(panel))[i] if i < len(e.get("reasons", [])) else "", raw_chars=0)
-            for i, m in enumerate(e.get("models", panel))
-        ]
-        return IntentResult(verdict=e["verdict"], votes=votes, cached=True)
+        # Panel-aware hit: a cached verdict only counts if it was produced by
+        # the same panel composition the caller is asking about. Otherwise an
+        # operator who rotates panel members (e.g., dropping a model that
+        # consistently dissents, or replacing one that's gone offline) would
+        # keep serving stale verdicts forever. Set-equality is used because
+        # the verdict doesn't depend on the order judges are listed.
+        cached_models = e.get("models") or []
+        if sorted(cached_models) == sorted(panel):
+            votes = [
+                PanelVote(model=m, verdict=e["verdict"],
+                          reason=e.get("reasons", [""] * len(cached_models))[i]
+                                 if i < len(e.get("reasons", [])) else "",
+                          raw_chars=0)
+                for i, m in enumerate(cached_models)
+            ]
+            return IntentResult(verdict=e["verdict"], votes=votes, cached=True)
+        # Panel mismatch — fall through and reclassify under the live panel.
 
     votes: list[Optional[PanelVote]] = [None] * len(panel)
     with ThreadPoolExecutor(max_workers=min(parallel_workers, len(panel))) as ex:

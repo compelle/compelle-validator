@@ -33,7 +33,13 @@ _NOT_FOUND_MARKERS = ("404", "no_such_model", "model_not_found", "model not foun
 # after exhausting retries). 429 = rate limit, 5xx = upstream outage, "timeout"
 # catches bare httpx.ReadTimeout strings that don't carry an HTTP status.
 _TRANSIENT_MARKERS = ("429", "503", "502", "504", "rate limit", "overloaded",
-                      "service unavailable", "timeout")
+                      "service unavailable", "timeout", "timed out")
+# Subset of _TRANSIENT_MARKERS that indicate the request took too long.
+# These get a tighter retry cap (see LLM.chat) because each attempt blocks for
+# the full httpx ReadTimeout window (~120s), and without a cap a single stuck
+# call can burn ~18 min before falling through.
+_TIMEOUT_MARKERS = ("timeout", "timed out")
+_MAX_TIMEOUT_ATTEMPTS = 3
 _VERDICT_WORDS = {
     "PRO": "Pro", "PROPOSITION": "Pro", "PROP": "Pro", "YES": "Pro", "AFFIRMATIVE": "Pro",
     "CON": "Con", "OPPOSITION": "Con", "OPP": "Con", "NO": "Con", "NEGATIVE": "Con",
@@ -79,6 +85,7 @@ class LLM:
 
     def chat(self, system, messages, model, max_tokens=2048, temperature=0.6) -> str:
         full = [{"role": "system", "content": system}] + messages
+        timeout_attempts = 0
         for attempt in range(8):
             try:
                 r = self.client.chat.completions.create(
@@ -90,6 +97,14 @@ class LLM:
                 s = str(e).lower()
                 if any(m in s for m in _NOT_FOUND_MARKERS):
                     raise ModelNotAvailableError(str(e)) from e
+                # Timeouts get a tighter cap: each attempt blocks for the full
+                # client ReadTimeout (~120s), so 8 attempts could stall ~18 min
+                # per call. Three is enough to ride out a transient blip while
+                # bounding worst-case wall-clock for stuck panel members.
+                if any(m in s for m in _TIMEOUT_MARKERS):
+                    timeout_attempts += 1
+                    if timeout_attempts >= _MAX_TIMEOUT_ATTEMPTS:
+                        raise
                 if any(m in s for m in _TRANSIENT_MARKERS) and attempt < 7:
                     time.sleep(min(2 ** attempt + random.random(), 60))
                     continue
