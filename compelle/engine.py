@@ -5,6 +5,7 @@ import math
 import time
 import random
 import logging
+import threading
 import itertools
 import hashlib
 from datetime import datetime, timezone
@@ -70,6 +71,56 @@ def parse_quota_reset(reason_str: str) -> str | None:
     return None
 
 
+_RATE_LIMIT_INTERVAL = float(os.environ.get("COMPELLE_LLM_MIN_INTERVAL", "1.0"))
+_rate_lock = threading.Lock()
+_next_send_ts = 0.0
+
+
+def _acquire_rate_token() -> None:
+    """Block until the global LLM dispatch token-bucket allows another call.
+
+    Process-wide token bucket: every chat.completions.create() must wait
+    until at least _RATE_LIMIT_INTERVAL seconds have elapsed since the
+    previous dispatch. With the default 1.0s, the validator emits at most
+    one outbound LLM request per second across all threads, panel members,
+    tournament games, and judges. This eliminates 429 burst-throttling
+    from Chutes because we never fire calls faster than the steady-state
+    quota allows.
+    """
+    global _next_send_ts
+    with _rate_lock:
+        now = time.time()
+        if _next_send_ts > now:
+            time.sleep(_next_send_ts - now)
+            _next_send_ts = _next_send_ts + _RATE_LIMIT_INTERVAL
+        else:
+            _next_send_ts = now + _RATE_LIMIT_INTERVAL
+
+
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Best-effort parse of Retry-After from a Chutes rate-limit exception.
+
+    The openai SDK exposes the httpx Response on RateLimitError via
+    `exc.response`. RFC 7231 allows Retry-After as either seconds or
+    HTTP-date; Chutes returns seconds. Returns None if the header is
+    absent or unparseable; callers fall back to exponential backoff.
+    """
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return None
+        headers = getattr(resp, "headers", None)
+        if headers is None:
+            return None
+        ra = headers.get("Retry-After") or headers.get("retry-after")
+        if ra is None:
+            return None
+        v = float(str(ra).strip())
+        return max(0.0, min(v, 120.0))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 class LLM:
     def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
         # HTTP/2 multiplexes many concurrent requests over a small TCP pool,
@@ -78,7 +129,9 @@ class LLM:
         # quickly on stuck pool/connect/write while still giving Chutes 45s
         # to start streaming a thinking-model response. max_retries=0 disables
         # the OpenAI SDK's sub-second retry storm so LLM.chat's exponential
-        # backoff is the only retry policy in play.
+        # backoff is the only retry policy in play. A process-wide token
+        # bucket (see _acquire_rate_token) caps outbound rate; see the
+        # COMPELLE_LLM_MIN_INTERVAL env var to tune.
         http = httpx.Client(
             http2=True,
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=200,
@@ -90,6 +143,7 @@ class LLM:
 
     def ping(self, model: str) -> tuple[bool, str]:
         try:
+            _acquire_rate_token()
             self.client.chat.completions.create(
                 model=model, messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1, temperature=0.0,
@@ -103,6 +157,7 @@ class LLM:
         timeout_attempts = 0
         for attempt in range(8):
             try:
+                _acquire_rate_token()
                 r = self.client.chat.completions.create(
                     model=model, messages=full,
                     max_tokens=max_tokens, temperature=temperature,
@@ -121,7 +176,14 @@ class LLM:
                     if timeout_attempts >= _MAX_TIMEOUT_ATTEMPTS:
                         raise
                 if any(m in s for m in _TRANSIENT_MARKERS) and attempt < 7:
-                    time.sleep(min(2 ** attempt + random.random(), 60))
+                    # Prefer the server's Retry-After when it tells us
+                    # exactly how long to wait; fall back to generic
+                    # exponential when the header is absent.
+                    ra = _extract_retry_after(e)
+                    if ra is not None:
+                        time.sleep(ra)
+                    else:
+                        time.sleep(min(2 ** attempt + random.random(), 60))
                     continue
                 raise
 

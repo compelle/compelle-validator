@@ -42,8 +42,8 @@
       "enabled": true,
       "models": [
         "zai-org/GLM-5.1-TEE",
-        "tngtech/DeepSeek-TNG-R1T2-Chimera-TEE",
-        "Qwen/Qwen3-235B-A22B-Thinking-2507"
+        "zai-org/GLM-5.1-TEE",
+        "zai-org/GLM-5.1-TEE"
       ],
       "max_tokens": 8192,
       "temperature": 0.1,
