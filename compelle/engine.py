@@ -144,7 +144,16 @@ class LLM:
             http2=False,
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=200,
                                 keepalive_expiry=30.0),
-            timeout=httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0),
+            # read=90s: empirical GLM-5.1 latency distribution on realistic 7-turn
+            # debate prompts under 20-concurrent load was 51-93s (median 65s,
+            # p90 91s, max 93s). Our prior 45s timeout was bailing on 100% of
+            # GLM calls, forcing the fallback chain to do the work every time
+            # ("timeouts" weren't real — GLM was completing fine, we just cut
+            # it off too soon). 90s catches >=90% of GLM calls at their median
+            # so the primary model actually gets used. Worst case on a
+            # genuinely-stuck call: ~45s more wait than before; that's small
+            # compared to the ~10-20s fallback adds anyway.
+            timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=5.0),
         )
         self.client = OpenAI(base_url=base_url, api_key=api_key,
                              http_client=http, max_retries=0)
