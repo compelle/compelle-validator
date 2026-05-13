@@ -33,9 +33,14 @@ _NOT_FOUND_MARKERS = ("404", "no_such_model", "model_not_found", "model not foun
 # Substrings that indicate a transient upstream condition worth retrying. Shared
 # by LLM.chat (same-model retry with backoff) and _chat (fallback to next model
 # after exhausting retries). 429 = rate limit, 5xx = upstream outage, "timeout"
-# catches bare httpx.ReadTimeout strings that don't carry an HTTP status.
+# catches bare httpx.ReadTimeout strings that don't carry an HTTP status,
+# "connection" catches httpx.ConnectError / RemoteProtocolError / TCP resets
+# that Chutes' load balancer surfaces as bare "Connection error." strings —
+# without this, every dropped HTTP/2 stream became "LLM error" and the game
+# ended in a draw without retry, voiding ~70% of every tournament.
 _TRANSIENT_MARKERS = ("429", "503", "502", "504", "rate limit", "overloaded",
-                      "service unavailable", "timeout", "timed out")
+                      "service unavailable", "timeout", "timed out",
+                      "connection error", "remote protocol")
 # Subset of _TRANSIENT_MARKERS that indicate the request took too long.
 # These get a tighter retry cap (see LLM.chat) because each attempt blocks for
 # the full httpx ReadTimeout window (~120s), and without a cap a single stuck
