@@ -128,17 +128,20 @@ def _extract_retry_after(exc: Exception) -> float | None:
 
 class LLM:
     def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
-        # HTTP/2 multiplexes many concurrent requests over a small TCP pool,
-        # which Chutes' per-IP throttle counts as fewer connections than
-        # one-socket-per-request HTTP/1.1. Per-phase timeouts let us bail
-        # quickly on stuck pool/connect/write while still giving Chutes 45s
-        # to start streaming a thinking-model response. max_retries=0 disables
+        # HTTP/1.1 with a keep-alive pool. We originally picked HTTP/2 to
+        # multiplex many requests over fewer sockets (friendlier to Chutes'
+        # per-IP throttle), but empirical head-to-head benchmarks showed
+        # HTTP/2 had a ~30% connection-error rate (Chutes' load balancer
+        # drops whole multiplex sockets, killing every in-flight stream)
+        # versus 0% under HTTP/1.1, plus 2-9x worse p90 latency. Per-phase
+        # timeouts let us bail quickly on stuck pool/connect/write while
+        # still giving Chutes 45s to start streaming. max_retries=0 disables
         # the OpenAI SDK's sub-second retry storm so LLM.chat's exponential
         # backoff is the only retry policy in play. A process-wide token
         # bucket (see _acquire_rate_token) caps outbound rate; see the
         # COMPELLE_LLM_MIN_INTERVAL env var to tune.
         http = httpx.Client(
-            http2=True,
+            http2=False,
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=200,
                                 keepalive_expiry=30.0),
             timeout=httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0),
