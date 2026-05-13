@@ -26,7 +26,8 @@
     },
     "tournament": {
       "epoch_seconds": 4320,
-      "max_concurrent_games": 10
+      "max_concurrent_games": 10,
+      "swiss_rounds": 3
     },
     "elo": {
       "k_factor": 32.0,
