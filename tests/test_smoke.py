@@ -1,5 +1,5 @@
 from compelle.engine import strip_thinking, resolve_strategy, MAX_STRATEGY_BYTES
-from compelle.validator import _block_from_filename, _validate_topics
+from compelle.validator import _block_from_filename, _validate_topics, _next_cycle_sleep
 
 
 def test_strip_thinking_removes_tagged_block():
@@ -75,3 +75,29 @@ def test_validate_topics_rejects_bad_framing():
 
 def test_validate_topics_rejects_empty_list():
     assert _validate_topics([]) is False
+
+
+def test_next_cycle_sleep_fills_to_tempo_when_tournament_short():
+    # 17m tournament with 72m tempo: sleep enough to make the cycle = one tempo.
+    assert _next_cycle_sleep(elapsed=17 * 60, epoch_seconds=4320,
+                              sw_failed=False) == 4320 - 17 * 60
+
+
+def test_next_cycle_sleep_zero_when_tournament_equals_tempo():
+    assert _next_cycle_sleep(elapsed=4320, epoch_seconds=4320,
+                              sw_failed=False) == 0.0
+
+
+def test_next_cycle_sleep_clamps_to_zero_when_tournament_longer_than_tempo():
+    # 90m tournament with 72m tempo: no sleep, start next immediately.
+    assert _next_cycle_sleep(elapsed=90 * 60, epoch_seconds=4320,
+                              sw_failed=False) == 0.0
+
+
+def test_next_cycle_sleep_set_weights_failure_short_retry():
+    # Failure path overrides the tempo math — short retry to recover.
+    assert _next_cycle_sleep(elapsed=5 * 60, epoch_seconds=4320,
+                              sw_failed=True) == 60.0
+    # Even if the tournament ran long, failure still gets the short retry.
+    assert _next_cycle_sleep(elapsed=100 * 60, epoch_seconds=4320,
+                              sw_failed=True) == 60.0

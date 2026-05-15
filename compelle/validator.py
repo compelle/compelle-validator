@@ -548,6 +548,27 @@ def _heartbeat_sleep(last_progress: list, total_secs: float) -> None:
         time.sleep(min(60.0, remaining))
 
 
+def _next_cycle_sleep(elapsed: float, epoch_seconds: float,
+                       sw_failed: bool) -> float:
+    """Return how long to sleep before the next epoch loop iteration.
+
+    Goal: total cycle length (tournament + sleep) equals one subnet tempo
+    (`epoch_seconds`). Without this, a 40-min tournament + 72-min sleep gives
+    a 112-min cycle, which is longer than the SN82 tempo (72 min) — so the
+    chain ends up using stale weights for whole tempos. By filling the cycle
+    instead of padding it, every tempo gets a fresh set_weights call.
+
+    Edge cases:
+      - `sw_failed`: short retry window so we recover within the same tempo.
+      - elapsed >= epoch_seconds (tournament longer than a tempo): clamp to 0
+        and start the next cycle immediately. Skipping tempos in this regime
+        is unavoidable without making the tournament itself faster.
+    """
+    if sw_failed:
+        return 60.0
+    return max(0.0, epoch_seconds - elapsed)
+
+
 def main():
     cfg = load_config()
     wallet, api_key = _preflight(cfg)
@@ -598,7 +619,8 @@ def main():
     last_chutes_quota_reset_at = None
 
     while True:
-        last_progress[0] = time.time()
+        cycle_start = time.time()
+        last_progress[0] = cycle_start
         epoch += 1
         log.info(f"=== epoch {epoch} ===")
 
@@ -766,11 +788,11 @@ def main():
         # skip the tournament, recompute weights from cached Elo, and retry
         # the chain submission. Once the tempo rolls over those weights are
         # gone, so a tight retry window is the only way to recover.
-        if sw_status == "failed":
-            sleep_secs = 60
-        else:
-            sleep_secs = cfg["tournament"]["epoch_seconds"]
-        log.info(f"epoch {epoch} done; next in {sleep_secs}s")
+        elapsed = time.time() - cycle_start
+        sleep_secs = _next_cycle_sleep(elapsed, cfg["tournament"]["epoch_seconds"],
+                                        sw_status == "failed")
+        log.info(f"epoch {epoch} done; next in {sleep_secs:.0f}s "
+                 f"(cycle elapsed {elapsed:.0f}s)")
         try: sub.close()
         except Exception as e: log.warning(f"subtensor close failed: {e}")
         _heartbeat_sleep(last_progress, sleep_secs)
