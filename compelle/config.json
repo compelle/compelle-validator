@@ -15,7 +15,6 @@
       "model_fallbacks": ["moonshotai/Kimi-K2.6-TEE", "Qwen/Qwen3-235B-A22B-Thinking-2507", "deepseek-ai/DeepSeek-V3.2-TEE"],
       "judge_panel": [
         "Qwen/Qwen3-235B-A22B-Thinking-2507",
-        "moonshotai/Kimi-K2.6-TEE",
         "zai-org/GLM-5.1-TEE"
       ],
       "judge_max_tokens": 8192,
@@ -32,7 +31,7 @@
     "elo": {
       "k_factor": 32.0,
       "temperature": 100.0,
-      "draw_penalty": 0.0,
+      "draw_penalty": 0.05,
       "initial_rating": 1000.0
     },
     "concession": {

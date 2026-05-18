@@ -677,24 +677,29 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     panel_record = [{"model": m, "verdict": w, "reason": (rsn or "")[:280]}
                     for (w, rsn, m) in votes]
 
-    # Safety net: only fall back to single-judge when the partial panel can't
-    # produce a clear winner — i.e., max side-count < 2. With a 3-judge panel
-    # plus one judge failing, a 2-0 partial result IS a clear majority and we
-    # should accept it; only 0/1-vote or split-1-1 cases need rejudging.
     pro_count = sum(1 for (w, _, _) in votes if w == "Pro")
     con_count = sum(1 for (w, _, _) in votes if w == "Con")
-    if max(pro_count, con_count) < 2:
-        log.warning(f"panel only {pro_count}-{con_count} ({len(votes)} valid votes); "
-                    f"falling back to single-judge")
-        return _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
-                             panel_record=panel_record,
-                             reason_prefix="Panel-insufficient → ")
+    total_votes = pro_count + con_count
 
+    # Insufficient: fewer than 2 valid votes after per-judge retries. Void the
+    # game rather than fall back to a single-judge tiebreaker — a flaky panel
+    # shouldn't silently degrade to a less-deliberated verdict. Void games are
+    # still recorded for audit but skip Elo / W-L bookkeeping in _play_round.
+    if total_votes < 2:
+        log.warning(f"panel incomplete: {total_votes}/{len(panel)} valid votes; voiding")
+        return GameResult(motion, "void",
+                          f"Panel incomplete {pro_count}-{con_count} → voided",
+                          len(transcript), transcript, duration,
+                          topic_data=topic_obj, topic_id=tid,
+                          judge_panel_votes=panel_record)
+
+    # Split: every panel member voted but they disagreed (1-1 in a 2-judge
+    # panel, 2-2 in a 4-judge panel, etc.). Declare a draw; Elo update applies
+    # the elo.draw_penalty to both miners as a mild "panel couldn't decide" tax.
     if pro_count == con_count:
-        # Reachable with even-sized panel and split votes (e.g., 4-judge 2-2).
-        # With the configured 5-judge panel this only fires if exactly one
-        # judge fails AND the remaining 4 split evenly, which is rare.
-        return GameResult(motion, "draw", f"Panel split {pro_count}-{con_count}",
+        log.warning(f"panel split {pro_count}-{con_count}; draw with penalty")
+        return GameResult(motion, "draw",
+                          f"Panel split {pro_count}-{con_count} → draw",
                           len(transcript), transcript, duration,
                           topic_data=topic_obj, topic_id=tid,
                           judge_panel_votes=panel_record)
@@ -900,11 +905,13 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
             # prefixed form ("Panel-insufficient → Judge error: ...") is
             # also recognized as an infrastructure failure.
             errored = "llm error" in reason or "judge error" in reason
-            if errored:
-                # Don't burn the matchup slot on infra failure: the same pair
-                # may succeed in a later round when Chutes recovers. Without
-                # this, a sustained Chutes outage causes every round to mark
-                # all pairs as played, forcing later rounds into the floater
+            voided = result.winner == "void"
+            if errored or voided:
+                # Don't burn the matchup slot on infra failure or panel void:
+                # the same pair may succeed in a later round when Chutes
+                # recovers or the panel produces enough valid votes. Without
+                # this, a sustained outage causes every round to mark all
+                # pairs as played, forcing later rounds into the floater
                 # rematch fallback and producing no useful Elo updates.
                 all_results.append((pro, con, result))
                 continue
