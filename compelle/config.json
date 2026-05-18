@@ -18,7 +18,7 @@
         "moonshotai/Kimi-K2.6-TEE",
         "zai-org/GLM-5.1-TEE"
       ],
-      "judge_max_tokens": 2048,
+      "judge_max_tokens": 8192,
       "max_turns": 5,
       "max_tokens_per_turn": 3072,
       "temperature": 0.6,
