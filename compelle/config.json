@@ -17,7 +17,7 @@
         "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "zai-org/GLM-5.1-TEE"
       ],
-      "judge_max_tokens": 2048,
+      "judge_max_tokens": 4096,
       "max_turns": 5,
       "max_tokens_per_turn": 3072,
       "temperature": 0.6,
@@ -31,7 +31,7 @@
     "elo": {
       "k_factor": 32.0,
       "temperature": 100.0,
-      "draw_penalty": 0.05,
+      "draw_penalty": 1.6,
       "initial_rating": 1000.0
     },
     "concession": {

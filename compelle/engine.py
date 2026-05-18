@@ -551,19 +551,27 @@ def _judge_deliberate(llm, config, judge_model: str, prompt: str,
     """
     cfg = config.get("game", {})
     judge_max_tokens = int(cfg.get("judge_max_tokens", 8192))
+    # Sanitize: empty reasons and embedded double-quotes produce visually
+    # broken prompts and may bias the model. Replace quotes with single
+    # quotes; substitute a neutral phrase when the original reason is empty.
+    my_reason_safe = (my_reason or "(no stated reason)").replace('"', "'")
+    other_reason_safe = (other_reason or "(no stated reason)").replace('"', "'")
     deliberate_prompt = (
         prompt
-        + f"\n\nYou previously voted {my_verdict} with the reason: \"{my_reason}\""
-        + f"\n\nAnother impartial judge looked at the same debate and voted "
-        + f"{other_verdict} with the reason: \"{other_reason}\""
-        + "\n\nReconsider in light of that opposing view. You may keep your "
-        "original verdict or switch, whichever you now believe is stronger. "
-        "Output exactly PRO or CON on line 1, then one sentence why."
+        + f"\n\nYour first reading produced: {my_verdict}. Your stated reason: \"{my_reason_safe}\""
+        + f"\n\nA second independent judge produced: {other_verdict}. Their reason: \"{other_reason_safe}\""
+        + "\n\nRe-examine the transcript with both readings on the table. "
+        "If your original verdict still strikes you as correct, keep it; "
+        "if the other reading exposes a flaw in yours, switch. Do not flip "
+        "merely because another judge disagreed, only flip if their argument "
+        "is genuinely stronger than your own.\n"
+        "Output exactly PRO or CON on line 1, then one sentence naming the "
+        "specific transcript moment that decides it."
     )
     try:
         verdict = llm.chat(
             "You are an impartial debate judge reconsidering after a panel split. "
-            "Respond with exactly PRO or CON on the first line.",
+            "You MUST pick a winner. Respond with exactly PRO or CON on the first line.",
             [{"role": "user", "content": deliberate_prompt}],
             judge_model, max_tokens=judge_max_tokens, temperature=0.3,
         )
@@ -719,7 +727,8 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
             if r is not None:
                 votes.append((r[0], r[1], futs[fut]))
 
-    panel_record = [{"model": m, "verdict": w, "reason": (rsn or "")[:280]}
+    panel_record = [{"model": m, "verdict": w, "reason": (rsn or "")[:280],
+                     "round": "first"}
                     for (w, rsn, m) in votes]
 
     pro_count = sum(1 for (w, _, _) in votes if w == "Pro")
@@ -747,6 +756,9 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     if pro_count == con_count:
         log.warning(f"panel split {pro_count}-{con_count}; running deliberation")
         new_votes: list = []
+        # Pairing: each judge sees the next judge's verdict (mod panel size).
+        # TODO: revisit if judge_panel grows past 2 — for larger panels, each
+        # judge should see ALL other votes, not just one neighbor.
         with ThreadPoolExecutor(max_workers=len(votes)) as ex:
             futs = {}
             for i, (w, rsn, m) in enumerate(votes):
@@ -767,13 +779,30 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
 
         new_pro = sum(1 for (w, _, _) in new_votes if w == "Pro")
         new_con = sum(1 for (w, _, _) in new_votes if w == "Con")
-        if (new_pro + new_con) >= 2 and new_pro != new_con:
+        total_new = new_pro + new_con
+
+        # Converged: 2+ votes, clear majority
+        if total_new >= 2 and new_pro != new_con:
             winner = "Pro" if new_pro > new_con else "Con"
             explanation = next(rsn for (w, rsn, _) in new_votes if w == winner)
             log.info(f"deliberation converged: {new_pro}-{new_con} → {winner}")
             return GameResult(
                 motion, winner,
                 f"Panel split {pro_count}-{con_count} → deliberation {new_pro}-{new_con} → {winner}",
+                len(transcript), transcript, duration, explanation,
+                topic_data=topic_obj, topic_id=tid,
+                judge_panel_votes=panel_record)
+
+        # Partial: only one judge returned a valid second-round vote. Use it
+        # as a tiebreaker rather than discarding informed signal. The single
+        # responder saw both first-round verdicts and chose deliberately.
+        if total_new == 1:
+            winner = "Pro" if new_pro == 1 else "Con"
+            explanation = new_votes[0][1]
+            log.info(f"deliberation partial: 1 valid vote → {winner} (tiebreaker)")
+            return GameResult(
+                motion, winner,
+                f"Panel split {pro_count}-{con_count} → deliberation 1-vote → {winner}",
                 len(transcript), transcript, duration, explanation,
                 topic_data=topic_obj, topic_id=tid,
                 judge_panel_votes=panel_record)
