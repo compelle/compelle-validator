@@ -1,7 +1,30 @@
 """Compelle subnet validator (Bittensor SN82)."""
 
+import hashlib
 import os
+import pathlib
 from importlib.metadata import PackageNotFoundError, version
+
+
+def _source_hash() -> str:
+    """SHA1 of all compelle/*.py source files, first 7 hex chars. Independent
+    of pip metadata and .git readability — proves what code is actually loaded.
+
+    Useful when operators do `git pull && systemctl restart` without
+    `pip install -e .` (importlib.metadata returns stale package version) or
+    when .git/HEAD isn't readable (tarball installs, systemd user perms).
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    h = hashlib.sha1()
+    try:
+        for p in sorted(pathlib.Path(pkg_dir).glob("*.py")):
+            with open(p, "rb") as f:
+                # include filename as part of the hash so renaming a file
+                # changes the hash even if content is identical
+                h.update(p.name.encode() + b"\0" + f.read() + b"\0")
+        return h.hexdigest()[:7]
+    except Exception:
+        return ""
 
 
 def _git_sha() -> str:
@@ -39,4 +62,9 @@ except PackageNotFoundError:
     __version__ = "0.1.0"
 
 GIT_SHA = _git_sha()
-FULL_VERSION = f"{__version__}+git.{GIT_SHA}" if GIT_SHA != "nogit" else __version__
+SRC_HASH = _source_hash()
+FULL_VERSION = __version__
+if GIT_SHA != "nogit":
+    FULL_VERSION += f"+git.{GIT_SHA}"
+if SRC_HASH:
+    FULL_VERSION += f"+src.{SRC_HASH}"
