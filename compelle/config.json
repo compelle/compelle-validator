@@ -12,7 +12,7 @@
   "old_config": {
     "game": {
       "model": "zai-org/GLM-5.1-TEE",
-      "model_fallbacks": ["moonshotai/Kimi-K2.6-TEE", "Qwen/Qwen3-235B-A22B-Thinking-2507", "deepseek-ai/DeepSeek-V3.2-TEE"],
+      "model_fallbacks": ["Qwen/Qwen3-235B-A22B-Thinking-2507", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
       "judge_panel": [
         "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "zai-org/GLM-5.1-TEE"
