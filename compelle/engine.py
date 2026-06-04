@@ -47,6 +47,17 @@ _TRANSIENT_MARKERS = ("429", "503", "502", "504", "rate limit", "overloaded",
 # call can burn ~18 min before falling through.
 _TIMEOUT_MARKERS = ("timeout", "timed out")
 _MAX_TIMEOUT_ATTEMPTS = 3
+# Subset of _TRANSIENT_MARKERS that mean the model is saturated right now
+# (HTTP 429 / "infrastructure is at maximum capacity"). Unlike a one-off
+# network blip, retrying the same model only burns Retry-After / backoff
+# sleeps while a healthy fallback sits idle, and our 1 req/s limiter
+# (_acquire_rate_token) already rules out self-inflicted bursts, so a 429 is
+# real upstream capacity rather than our own rate. Fail over to the next model
+# on the first hit. The primary is still tried first on every call, so a model
+# with capacity answers on attempt 0 and the common path is unchanged.
+_CAPACITY_MARKERS = ("429", "too many requests", "rate limit",
+                     "at capacity", "maximum capacity")
+_MAX_CAPACITY_ATTEMPTS = 1
 _VERDICT_WORDS = {
     "PRO": "Pro", "PROPOSITION": "Pro", "PROP": "Pro", "YES": "Pro", "AFFIRMATIVE": "Pro",
     "CON": "Con", "OPPOSITION": "Con", "OPP": "Con", "NO": "Con", "NEGATIVE": "Con",
@@ -172,6 +183,7 @@ class LLM:
     def chat(self, system, messages, model, max_tokens=2048, temperature=0.6) -> str:
         full = [{"role": "system", "content": system}] + messages
         timeout_attempts = 0
+        capacity_attempts = 0
         for attempt in range(8):
             try:
                 _acquire_rate_token()
@@ -191,6 +203,10 @@ class LLM:
                 if any(m in s for m in _TIMEOUT_MARKERS):
                     timeout_attempts += 1
                     if timeout_attempts >= _MAX_TIMEOUT_ATTEMPTS:
+                        raise
+                if any(m in s for m in _CAPACITY_MARKERS):
+                    capacity_attempts += 1
+                    if capacity_attempts >= _MAX_CAPACITY_ATTEMPTS:
                         raise
                 if any(m in s for m in _TRANSIENT_MARKERS) and attempt < 7:
                     # Prefer the server's Retry-After when it tells us
