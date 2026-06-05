@@ -338,22 +338,119 @@ class GameResult:
     judge_panel_votes: list = field(default_factory=list)
 
 
+# --- Primary-model circuit breaker -------------------------------------------
+# GLM (the configured primary) is preferred whenever it is healthy, but under a
+# Chutes capacity crunch it straddles our 90s read timeout: most calls still
+# complete, just slowly, so every _chat pays up to the full timeout on the
+# primary before falling over. Across a tournament that turns a ~50-minute run
+# into hours. The 429 fast-failover (see _CAPACITY_MARKERS) handles outright
+# rejection but not the slow-but-completing case. This breaker watches
+# consecutive primary failures (timeouts and capacity) and, once the primary is
+# clearly degraded, OPENS: _chat skips the primary and starts at the first
+# fallback for a cooldown window, so no call pays the primary's tax while it is
+# down. The cooldown grows exponentially as the primary keeps failing. When it
+# expires the breaker goes HALF-OPEN and the next call verifies recovery with a
+# cheap one-token ping (see LLM.ping); success CLOSES it (back to "prefer GLM"),
+# failure re-opens it with a longer cooldown. State is process-wide, like
+# _acquire_rate_token; one shared instance, GLM is the only primary in play.
+_BREAKER_FAIL_THRESHOLD = 3      # consecutive primary failures before opening
+_BREAKER_BASE_COOLDOWN = 30.0    # seconds the primary is skipped on the first open
+_BREAKER_MAX_COOLDOWN = 300.0    # cap on the exponential cooldown growth
+
+
+class _PrimaryBreaker:
+    """Thread-safe health gate for the configured primary model."""
+
+    def __init__(self, threshold: int, base_cooldown: float, max_cooldown: float):
+        self._threshold = threshold
+        self._base = base_cooldown
+        self._max = max_cooldown
+        self._lock = threading.Lock()
+        self._state = "closed"     # closed | open | half_open
+        self._fails = 0            # consecutive primary failures while closed
+        self._opens = 0            # consecutive opens, drives backoff growth
+        self._open_until = 0.0     # monotonic deadline of the current cooldown
+        self._probing = False      # a half-open recovery probe is in flight
+
+    def gate(self) -> str:
+        """Return "use" (try the primary normally), "probe" (it may have
+        recovered, verify with a cheap ping first), or "skip" (primary is down,
+        go straight to the fallback)."""
+        with self._lock:
+            if self._state == "open" and time.monotonic() >= self._open_until:
+                self._state = "half_open"
+                self._probing = False
+            if self._state == "closed":
+                return "use"
+            if self._state == "half_open" and not self._probing:
+                self._probing = True
+                return "probe"
+            return "skip"
+
+    def record(self, ok: bool) -> None:
+        """Report a primary outcome (a real call while closed, or the ping while
+        half-open). Closes on success; opens or re-opens with a growing cooldown
+        on failure. Failures that arrive after the breaker already opened (stale
+        in-flight calls) are ignored so they do not inflate the backoff."""
+        with self._lock:
+            if ok:
+                self._state, self._fails, self._opens, self._probing = "closed", 0, 0, False
+                return
+            if self._state == "half_open":
+                self._probing = False
+                self._opens += 1
+            elif self._state == "closed":
+                self._fails += 1
+                if self._fails < self._threshold:
+                    return
+                self._opens += 1
+            else:  # already open: a stale in-flight failure, ignore
+                return
+            self._state = "open"
+            self._open_until = time.monotonic() + min(
+                self._base * (2 ** (self._opens - 1)), self._max)
+
+
+_primary_breaker = _PrimaryBreaker(_BREAKER_FAIL_THRESHOLD,
+                                   _BREAKER_BASE_COOLDOWN, _BREAKER_MAX_COOLDOWN)
+
+
 def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
     """Try `primary` first, then each fallback. Falls back on:
       - ModelNotAvailableError (404 / unknown model)
       - persistent throttling (429) or upstream outage (503/502/504) — these
         are exhausted by `LLM.chat`'s internal retry first, so by the time we
         catch one here the primary has already burned its retries.
+    The primary circuit breaker (above) may skip the primary outright while it
+    is degraded, or verify recovery with a cheap ping before reusing it.
     """
     models = [primary] + [m for m in fallbacks if m != primary]
+    has_fallback = len(models) > 1
+    # Consult the breaker only when there is a fallback to skip to.
+    gate = _primary_breaker.gate() if has_fallback else "use"
     last: Exception | None = None
-    for m in models:
+    for i, m in enumerate(models):
+        if i == 0 and gate == "skip":
+            continue
+        if i == 0 and gate == "probe":
+            # Cheap recovery check: a one-token ping, no retry, so the probe
+            # costs about a second when the primary is back and at most one
+            # read-timeout when it is still down, never a full retry budget.
+            ok, _ = llm.ping(m)
+            _primary_breaker.record(ok)
+            if not ok:
+                continue
         try:
-            return llm.chat(system, history, m, max_tok, temp)
+            out = llm.chat(system, history, m, max_tok, temp)
         except ModelNotAvailableError as e:
+            if i == 0 and has_fallback and gate == "use":
+                _primary_breaker.record(False)
             log.warning("model %s unavailable, falling back", m)
             last = e
+            continue
         except Exception as e:
+            if i == 0 and has_fallback and gate == "use":
+                _primary_breaker.record(False)
             s = str(e).lower()
             transient = any(c in s for c in _TRANSIENT_MARKERS)
             if transient and m != models[-1]:
@@ -361,6 +458,10 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
                 last = e
                 continue
             raise
+        else:
+            if i == 0 and has_fallback and gate == "use":
+                _primary_breaker.record(True)
+            return out
     raise last  # type: ignore[misc]
 
 
