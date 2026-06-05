@@ -416,9 +416,9 @@ class _PrimaryBreaker:
 
 
 # One breaker per model id, created on first use. A model's health is shared
-# across every role it plays — debate primary (_chat) and judge panel slot
-# (_judge_one) — so a GLM that is circuit-broken as a judge is also skipped on
-# the debate path, and vice versa.
+# across every role it plays (debate primary in _chat and judge panel slot in
+# _judge_one), so a model circuit-broken as a judge is also skipped on the
+# debate path, and vice versa.
 _breakers: dict = {}
 _breakers_lock = threading.Lock()
 
@@ -455,20 +455,23 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
             # Cheap recovery check: a one-token ping, no retry, so the probe
             # costs about a second when the primary is back and at most one
             # read-timeout when it is still down, never a full retry budget.
-            ok, _ = llm.ping(m)
+            try:
+                ok, _ = llm.ping(m)
+            except Exception:
+                ok = False  # a raising ping must still clear the half-open prober
             breaker.record(ok)
             if not ok:
                 continue
         try:
             out = llm.chat(system, history, m, max_tok, temp)
         except ModelNotAvailableError as e:
-            if i == 0 and has_fallback and gate == "use":
+            if i == 0 and has_fallback and gate in ("use", "probe"):
                 breaker.record(False)
             log.warning("model %s unavailable, falling back", m)
             last = e
             continue
         except Exception as e:
-            if i == 0 and has_fallback and gate == "use":
+            if i == 0 and has_fallback and gate in ("use", "probe"):
                 breaker.record(False)
             s = str(e).lower()
             transient = any(c in s for c in _TRANSIENT_MARKERS)
@@ -478,7 +481,7 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
                 continue
             raise
         else:
-            if i == 0 and has_fallback and gate == "use":
+            if i == 0 and has_fallback and gate in ("use", "probe"):
                 breaker.record(True)
             return out
     raise last  # type: ignore[misc]
@@ -728,17 +731,19 @@ def _judge_deliberate(llm, config, judge_model: str, prompt: str,
 def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[str, str] | None:
     """Run a single judge model. Returns (verdict, reason) or None on failure.
 
-    Each panel member is queried with itself as primary. The 2nd attempt
-    OPTIONALLY switches to `game.judge_fallback_model` if configured (e.g.,
-    a fast/lightly-loaded model like the debater primary), which helps when
-    Chutes is throttling a specific model's queue under burst load — the
-    fallback model has its own queue. Without `judge_fallback_model`, the
-    2nd attempt repeats the original model (legacy behavior).
+    Each panel member is queried with itself as primary. Two things can divert
+    a slot to `game.judge_fallback_model` (a fast, lightly loaded model with its
+    own Chutes queue, typically the debater primary):
+      - the per-model circuit breaker (see _breaker_for): if this judge model
+        is already known degraded, attempt 0 skips straight to the fallback, or
+        cheap-pings to verify recovery first.
+      - a failed attempt 0: attempt 1 retries on the fallback.
+    Without `judge_fallback_model` configured there is no breaker, and attempt 1
+    repeats the original model (legacy behavior).
 
-    Diversity rationale: even with the fallback firing, the panel still
-    receives one vote per panel slot; falling through to a single different
-    model is preferable to losing the vote entirely (which forces
-    single-judge fallback at the panel level).
+    Diversity rationale: even when the fallback fires, the panel still gets one
+    vote per slot. Falling through to a single different model beats losing the
+    vote entirely, which pushes the panel toward voiding the game.
     """
     cfg = config.get("game", {})
     # Thinking-heavy models (Kimi, Qwen3-Thinking, DeepSeek) routinely burn
@@ -760,7 +765,10 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
         if attempt == 0 and gate == "skip":
             model_to_use = fallback_model
         elif attempt == 0 and gate == "probe":
-            ok, _ = llm.ping(judge_model)
+            try:
+                ok, _ = llm.ping(judge_model)
+            except Exception:
+                ok = False  # a raising ping must still clear the half-open prober
             breaker.record(ok)
             model_to_use = judge_model if ok else fallback_model
         elif attempt == 0:
@@ -775,14 +783,14 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
                 model_to_use, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
             )
         except Exception as e:
-            if breaker and attempt == 0 and model_to_use == judge_model and gate == "use":
+            if breaker and attempt == 0 and model_to_use == judge_model and gate in ("use", "probe"):
                 breaker.record(False)
             log.warning("judge %s attempt %d (model=%s) failed: %s",
                         judge_model, attempt + 1, model_to_use, str(e)[:80])
             if attempt == 1:
                 return None
             continue
-        if breaker and attempt == 0 and model_to_use == judge_model and gate == "use":
+        if breaker and attempt == 0 and model_to_use == judge_model and gate in ("use", "probe"):
             breaker.record(True)  # the model answered; healthy regardless of parse
         clean = strip_thinking(verdict, tags) or verdict.strip()
         lines = [line.strip() for line in clean.split("\n") if line.strip()]
@@ -853,15 +861,22 @@ def judge_game(llm, config, topic_obj, motion, transcript, duration) -> GameResu
     """Judge a debate via configurable judge panel.
 
     Reads `judge_panel` from game config (list of model IDs). Falls back to the
-    legacy single-judge config (judge_model + judge_model_fallbacks) when
+    legacy single-judge config (judge_model + judge_model_fallbacks) only when
     judge_panel is absent or empty. Panel members vote independently in
-    parallel and the majority verdict wins. With odd panel sizes ties are
-    impossible barring all-judge failure.
+    parallel; the majority verdict wins.
 
-    Safety net: if fewer than 3 panel members produce a valid vote (i.e. one
-    or more models are down or returning malformed verdicts), fall through to
-    the single-judge path. Threshold of 3 is the smallest sample for a
-    statistically meaningful majority.
+    Resolution, in order:
+      - fewer than 2 valid votes (models down or returning malformed verdicts):
+        the game is VOIDED rather than decided by a single judge. Each panel
+        slot already retries once via game.judge_fallback_model (see
+        _judge_one), so reaching this means at least two slots failed both
+        attempts. Voids are recorded for audit but skip Elo / W-L in
+        _play_round.
+      - a tie (e.g. 1-1 on this 2-model panel): run one deliberation round in
+        which each judge sees another's verdict, then take the converged
+        majority, the lone second-round vote as a tiebreaker, or a draw with
+        penalty if it stays split.
+      - otherwise: the first-round majority wins.
     """
     cfg = config["game"]
     transcript_text = "\n\n".join(f"[{e['speaker']}]: {e['text']}" for e in transcript)

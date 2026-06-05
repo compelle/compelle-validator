@@ -29,12 +29,15 @@ class FakeClient:
         self.by_model = by_model
         self.calls = []
         self.token_budgets = []  # max_tokens per call; a 1 marks a recovery ping
+        self.ping_ok = set()     # models whose 1-token ping succeeds even if heavy calls fail
         self.chat = self
         self.completions = self
 
     def create(self, model, messages, max_tokens, temperature):
         self.calls.append(model)
         self.token_budgets.append(max_tokens)
+        if max_tokens == 1 and model in self.ping_ok:
+            return _resp("pong")  # cheap recovery ping succeeds even when heavy calls fail
         kind, payload = self.by_model[model]
         if kind == "raise":
             raise payload
@@ -60,7 +63,7 @@ def _isolate_breaker():
 def breaker(monkeypatch):
     # Controllable monotonic clock so cooldown / half-open transitions are
     # deterministic. Breakers are created lazily by _breaker_for (threshold 3,
-    # 30s base, 300s cap — the module defaults), so we just clear the registry
+    # 30s base, 300s cap, the module defaults), so we just clear the registry
     # and drive the clock. The returned handle's .advance(seconds) moves time.
     clock = {"t": 1000.0}
     monkeypatch.setattr(engine.time, "monotonic", lambda: clock["t"])
@@ -218,7 +221,7 @@ def test_breaker_never_skips_without_a_fallback(fast, breaker):
 # --- Judge-panel circuit breaker --------------------------------------------
 # Business rule: the same per-model breaker also guards the judge path. A panel
 # judge model (e.g. GLM) that keeps failing must not burn the read-timeout
-# budget on every judged game — once its breaker opens, _judge_one skips it
+# budget on every judged game; once its breaker opens, _judge_one skips it
 # straight to the configured judge_fallback_model, and recovers by cheap ping.
 
 JUDGE_CFG = {"game": {"judge_max_tokens": 64, "judge_fallback_model": "qwen"}}
@@ -249,3 +252,40 @@ def test_judge_breaker_recovers_via_ping(fast, breaker):
     breaker.advance(31)                                           # past the 30s cooldown
     assert _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"]) == ("Pro", "glm back")
     assert llm.client.token_budgets.count(1) == 1                # exactly one cheap ping
+
+
+def test_judge_breaker_counts_heavy_failure_after_probe(fast, breaker):
+    # Slow-but-pingable crunch: the 1-token recovery ping succeeds while the
+    # full judge call still fails. The probe closes the breaker, but that heavy
+    # failure must still be counted, otherwise a ping alone whitewashes a model
+    # that cannot actually judge and the breaker never re-trips.
+    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
+    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "CON\nfb")})
+    for _ in range(3):
+        _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"])         # open the breaker
+    llm.client.ping_ok.add("glm")                                 # ping now succeeds...
+    breaker.advance(31)                                           # half-open
+    _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"])             # probe: ping ok, heavy fails
+    b = engine._breaker_for("glm")
+    assert b._state == "closed"     # the ping recovered it
+    assert b._fails == 1            # but the heavy failure on that probe was recorded
+
+
+def test_judge_breaker_survives_a_raising_ping(fast, breaker, monkeypatch):
+    # If ping() is ever made to raise (e.g. an overlaid LLM), the half-open
+    # prober must still clear, not stick True forever and pin the model to its
+    # fallback for the life of the process.
+    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
+    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "CON\nfb")})
+    for _ in range(3):
+        _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"])         # open the breaker
+
+    def _boom(*a, **k):
+        raise RuntimeError("ping blew up")
+    monkeypatch.setattr(llm, "ping", _boom)
+    breaker.advance(31)                                           # half-open
+    _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"])             # probe: ping raises
+    b = engine._breaker_for("glm")
+    assert b._probing is False      # prober cleared despite the raise
+    breaker.advance(61)             # past the re-grown cooldown
+    assert b.gate() == "probe"      # it can probe again, not stuck on skip
