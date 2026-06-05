@@ -6,10 +6,12 @@ rather than burning the 8-attempt backoff loop on it. The primary stays first
 on every call, so a model that has capacity is still used (we "prefer GLM if it
 is up"). Timeouts keep their separate, deliberate 3-attempt cap.
 """
+import logging
+
 import pytest
 
 from compelle import engine
-from compelle.engine import LLM, _chat
+from compelle.engine import LLM, _chat, _judge_one
 
 
 def _resp(content):
@@ -49,27 +51,51 @@ def fast(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_breaker():
-    # The primary breaker is process-wide state; reset it to closed before each
+    # Per-model breakers are process-wide state; clear the registry before each
     # test so neither it nor the pre-existing tests leak state across the suite.
-    b = engine._primary_breaker
-    b._state, b._fails, b._opens, b._open_until, b._probing = "closed", 0, 0, 0.0, False
+    engine._breakers.clear()
 
 
 @pytest.fixture
 def breaker(monkeypatch):
-    # A breaker with a controllable monotonic clock so cooldown / half-open
-    # transitions are deterministic (threshold 3, 30s base, 300s cap, matching
-    # the module defaults). The returned handle's .advance(seconds) moves time.
+    # Controllable monotonic clock so cooldown / half-open transitions are
+    # deterministic. Breakers are created lazily by _breaker_for (threshold 3,
+    # 30s base, 300s cap — the module defaults), so we just clear the registry
+    # and drive the clock. The returned handle's .advance(seconds) moves time.
     clock = {"t": 1000.0}
     monkeypatch.setattr(engine.time, "monotonic", lambda: clock["t"])
-    monkeypatch.setattr(engine, "_primary_breaker",
-                        engine._PrimaryBreaker(3, 30.0, 300.0))
+    engine._breakers.clear()
 
     class _Clock:
         def advance(self, seconds):
             clock["t"] += seconds
 
     return _Clock()
+
+
+@pytest.fixture
+def engine_logs():
+    # Capture compelle.engine messages straight off its logger. We can't use
+    # pytest's caplog here: compelle.validator runs logging.basicConfig() at
+    # import, so once the full suite imports it, caplog's root-handler capture
+    # breaks (assertions then pass in isolation but fail in-suite). Reading
+    # directly off the engine logger is order-independent.
+    logger = logging.getLogger("compelle.engine")
+    msgs = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            msgs.append(record.getMessage())
+
+    handler = _Capture()
+    prev = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield msgs
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev)
 
 
 def _llm(by_model):
@@ -123,7 +149,7 @@ def test_timeout_path_still_retries_three_times(fast):
 # while removing the per-call timeout tax when it is down.
 
 
-def test_breaker_opens_and_skips_primary_after_threshold(fast, breaker):
+def test_breaker_opens_and_skips_primary_after_threshold(fast, breaker, engine_logs):
     # Three consecutive primary failures (the threshold) trip the breaker; the
     # next call must not touch the primary at all.
     exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
@@ -135,9 +161,12 @@ def test_breaker_opens_and_skips_primary_after_threshold(fast, breaker):
     assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
     assert llm.client.calls.count("glm") == 3      # GLM was not tried again
     assert llm.client.calls[-1] == "qwen"
+    # The transition must be observable: opening is a single logged event, not
+    # a silent degrade (this is the whole point of the breaker on mainnet).
+    assert any("circuit breaker OPEN" in m for m in engine_logs)
 
 
-def test_breaker_recovers_via_cheap_ping(fast, breaker):
+def test_breaker_recovers_via_cheap_ping(fast, breaker, engine_logs):
     # Once the cooldown lapses the breaker half-opens; the next call probes with
     # a one-token ping, and a healthy reply closes it so GLM is used again.
     exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
@@ -151,6 +180,10 @@ def test_breaker_recovers_via_cheap_ping(fast, breaker):
     # Closed again: a later call uses GLM directly, no further ping.
     assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "primary back"
     assert llm.client.token_budgets.count(1) == 1
+    # The probe and the recovery are both logged so an operator can see the
+    # breaker heal itself rather than infer it from the absence of warnings.
+    assert any("HALF-OPEN" in m for m in engine_logs)
+    assert any("circuit breaker CLOSED" in m for m in engine_logs)
 
 
 def test_breaker_probe_failure_grows_cooldown(fast, breaker):
@@ -180,3 +213,39 @@ def test_breaker_never_skips_without_a_fallback(fast, breaker):
         with pytest.raises(Exception):
             _chat(llm, "s", MSGS, "glm", [], 256, 0.6)
     assert llm.client.calls == ["glm"] * 5
+
+
+# --- Judge-panel circuit breaker --------------------------------------------
+# Business rule: the same per-model breaker also guards the judge path. A panel
+# judge model (e.g. GLM) that keeps failing must not burn the read-timeout
+# budget on every judged game — once its breaker opens, _judge_one skips it
+# straight to the configured judge_fallback_model, and recovers by cheap ping.
+
+JUDGE_CFG = {"game": {"judge_max_tokens": 64, "judge_fallback_model": "qwen"}}
+
+
+def test_judge_breaker_skips_degraded_judge_model(fast, breaker):
+    # Three consecutive judge failures open the model's breaker; the next judged
+    # game must skip the judge model entirely and use the fallback.
+    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
+    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "CON\nstronger case")})
+    for _ in range(3):
+        assert _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"]) == ("Con", "stronger case")
+    assert llm.client.calls.count("glm") == 3      # three failed first-attempts
+    # OPEN now: the GLM judge slot goes straight to the fallback, no GLM call.
+    assert _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"]) == ("Con", "stronger case")
+    assert llm.client.calls.count("glm") == 3      # GLM judge was not tried again
+    assert llm.client.calls[-1] == "qwen"
+
+
+def test_judge_breaker_recovers_via_ping(fast, breaker):
+    # Once the cooldown lapses the judge breaker half-opens and probes the judge
+    # model with a one-token ping; a healthy reply closes it so GLM judges again.
+    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
+    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "CON\nfallback")})
+    for _ in range(3):
+        _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"])         # open it
+    llm.client.by_model["glm"] = ("ok", "PRO\nglm back")          # GLM judge recovers
+    breaker.advance(31)                                           # past the 30s cooldown
+    assert _judge_one(llm, JUDGE_CFG, "glm", "t", ["think"]) == ("Pro", "glm back")
+    assert llm.client.token_budgets.count(1) == 1                # exactly one cheap ping

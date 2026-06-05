@@ -384,6 +384,7 @@ class _PrimaryBreaker:
                 return "use"
             if self._state == "half_open" and not self._probing:
                 self._probing = True
+                log.info("primary circuit breaker HALF-OPEN: probing recovery")
                 return "probe"
             return "skip"
 
@@ -394,6 +395,8 @@ class _PrimaryBreaker:
         in-flight calls) are ignored so they do not inflate the backoff."""
         with self._lock:
             if ok:
+                if self._state != "closed":
+                    log.info("primary circuit breaker CLOSED: primary recovered")
                 self._state, self._fails, self._opens, self._probing = "closed", 0, 0, False
                 return
             if self._state == "half_open":
@@ -407,12 +410,27 @@ class _PrimaryBreaker:
             else:  # already open: a stale in-flight failure, ignore
                 return
             self._state = "open"
-            self._open_until = time.monotonic() + min(
-                self._base * (2 ** (self._opens - 1)), self._max)
+            cooldown = min(self._base * (2 ** (self._opens - 1)), self._max)
+            self._open_until = time.monotonic() + cooldown
+            log.warning("primary circuit breaker OPEN: skipping primary for %.0fs", cooldown)
 
 
-_primary_breaker = _PrimaryBreaker(_BREAKER_FAIL_THRESHOLD,
-                                   _BREAKER_BASE_COOLDOWN, _BREAKER_MAX_COOLDOWN)
+# One breaker per model id, created on first use. A model's health is shared
+# across every role it plays — debate primary (_chat) and judge panel slot
+# (_judge_one) — so a GLM that is circuit-broken as a judge is also skipped on
+# the debate path, and vice versa.
+_breakers: dict = {}
+_breakers_lock = threading.Lock()
+
+
+def _breaker_for(model: str) -> _PrimaryBreaker:
+    with _breakers_lock:
+        b = _breakers.get(model)
+        if b is None:
+            b = _PrimaryBreaker(_BREAKER_FAIL_THRESHOLD,
+                                _BREAKER_BASE_COOLDOWN, _BREAKER_MAX_COOLDOWN)
+            _breakers[model] = b
+        return b
 
 
 def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
@@ -427,7 +445,8 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
     models = [primary] + [m for m in fallbacks if m != primary]
     has_fallback = len(models) > 1
     # Consult the breaker only when there is a fallback to skip to.
-    gate = _primary_breaker.gate() if has_fallback else "use"
+    breaker = _breaker_for(primary)
+    gate = breaker.gate() if has_fallback else "use"
     last: Exception | None = None
     for i, m in enumerate(models):
         if i == 0 and gate == "skip":
@@ -437,20 +456,20 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
             # costs about a second when the primary is back and at most one
             # read-timeout when it is still down, never a full retry budget.
             ok, _ = llm.ping(m)
-            _primary_breaker.record(ok)
+            breaker.record(ok)
             if not ok:
                 continue
         try:
             out = llm.chat(system, history, m, max_tok, temp)
         except ModelNotAvailableError as e:
             if i == 0 and has_fallback and gate == "use":
-                _primary_breaker.record(False)
+                breaker.record(False)
             log.warning("model %s unavailable, falling back", m)
             last = e
             continue
         except Exception as e:
             if i == 0 and has_fallback and gate == "use":
-                _primary_breaker.record(False)
+                breaker.record(False)
             s = str(e).lower()
             transient = any(c in s for c in _TRANSIENT_MARKERS)
             if transient and m != models[-1]:
@@ -460,7 +479,7 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
             raise
         else:
             if i == 0 and has_fallback and gate == "use":
-                _primary_breaker.record(True)
+                breaker.record(True)
             return out
     raise last  # type: ignore[misc]
 
@@ -728,10 +747,26 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
     # intent_classifier ceiling so the panel has consistent headroom.
     judge_max_tokens = int(cfg.get("judge_max_tokens", 8192))
     fallback_model = cfg.get("judge_fallback_model") or None
+    # Belt: a circuit breaker on the judge model, the same one the debate path
+    # uses. When this judge model is degraded (e.g. GLM under a Chutes crunch)
+    # we skip it straight to the fallback instead of burning the read-timeout
+    # budget on a call that will fail. Only meaningful when a fallback exists.
+    breaker = _breaker_for(judge_model) if fallback_model else None
+    gate = breaker.gate() if breaker else "use"
     for attempt in range(2):
-        # On attempt 2, switch to the configured fallback model if any.
-        # This sidesteps per-model Chutes throttling without losing the vote.
-        model_to_use = judge_model if attempt == 0 else (fallback_model or judge_model)
+        # Attempt 0 normally uses the judge model; the breaker may redirect it
+        # to the fallback (skip) or verify recovery with a cheap ping (probe).
+        # Attempt 1 is the fallback model, sidestepping per-model throttling.
+        if attempt == 0 and gate == "skip":
+            model_to_use = fallback_model
+        elif attempt == 0 and gate == "probe":
+            ok, _ = llm.ping(judge_model)
+            breaker.record(ok)
+            model_to_use = judge_model if ok else fallback_model
+        elif attempt == 0:
+            model_to_use = judge_model
+        else:
+            model_to_use = fallback_model or judge_model
         try:
             verdict = llm.chat(
                 "You are an impartial debate judge. You MUST pick a winner. "
@@ -740,11 +775,15 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
                 model_to_use, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
             )
         except Exception as e:
+            if breaker and attempt == 0 and model_to_use == judge_model and gate == "use":
+                breaker.record(False)
             log.warning("judge %s attempt %d (model=%s) failed: %s",
                         judge_model, attempt + 1, model_to_use, str(e)[:80])
             if attempt == 1:
                 return None
             continue
+        if breaker and attempt == 0 and model_to_use == judge_model and gate == "use":
+            breaker.record(True)  # the model answered; healthy regardless of parse
         clean = strip_thinking(verdict, tags) or verdict.strip()
         lines = [line.strip() for line in clean.split("\n") if line.strip()]
         if not lines:
