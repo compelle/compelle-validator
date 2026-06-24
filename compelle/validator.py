@@ -17,7 +17,7 @@ from compelle.engine import (
     LLM, Elo, run_tournament, resolve_strategy, _GIST_REVISIONED_RE,
     parse_quota_reset,
 )
-from compelle.eligibility import fetch_records, assign_weights
+from compelle.eligibility import fetch_records
 from compelle.intent_classifier import classify_records
 
 
@@ -479,6 +479,108 @@ def load_elo(default_k: float, default_initial: float):
         return Elo(k=default_k, initial=default_initial)
 
 
+KOTH_DEFENSE_MARGIN = 200.0  # a contender must lead the king's Elo by this much,
+KOTH_DETHRONE_EPOCHS = 20    # and hold that lead this many consecutive epochs (~1 day), to be crowned
+KOTH_STATE_PATH = f"{DATA_DIR}/koth_state.json"
+
+
+def _load_koth() -> dict:
+    """King-of-the-hill streak state: {tempo, challenger, streak}. `tempo` is the
+    tempo index the streak was last advanced for, so a mid-tempo restart reuses
+    the stored decision instead of double-counting the same epoch."""
+    try:
+        with open(KOTH_STATE_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"tempo": -1, "challenger": None, "streak": 0}
+    except Exception as e:
+        log.warning(f"koth state load failed ({e}); starting fresh")
+        return {"tempo": -1, "challenger": None, "streak": 0}
+
+
+def _save_koth(state: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = KOTH_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, KOTH_STATE_PATH)
+    except Exception as e:
+        log.warning(f"koth state save failed: {e}")
+
+
+def _incumbent_king(sub, netuid):
+    """Hotkey with the highest consensus weight last epoch = the reigning king.
+    Read from chain so every validator anchors to the SAME incumbent (consensus
+    is shared state; local Elo is not). Returns None only on a chain-read
+    failure; koth_weights then holds the prior on-chain weights rather than
+    crowning a divergent local leader."""
+    try:
+        mg = sub.metagraph(netuid, lite=True)
+        top_uid = max(range(len(mg.consensus)), key=lambda i: mg.consensus[i])
+        return list(mg.hotkeys)[top_uid]
+    except Exception as e:
+        log.warning(f"KOTH incumbent read failed: {e}")
+        return None
+
+
+def koth_weights(sub, netuid, elo, eligible, current_tempo,
+                 margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS):
+    """Winner-take-all king of the hill.
+
+    King = highest consensus weight last epoch. A challenger is crowned only if it
+    holds Elo >= king + 200 for one day (20 consecutive epochs). The crowned king
+    takes literally 100%.
+
+    The streak is keyed on hotkey, never on UID: UIDs recycle on deregistration,
+    so a fresh miner could otherwise inherit a dead slot's streak. It resets to
+    zero on any single epoch the top contender falls below the line, or if the
+    contender's hotkey changes. A miner can't swap its strategy mid-climb to
+    launder a streak: eligibility requires the commitment to land within
+    ELIGIBILITY_WINDOW_BLOCKS of registration (see eligibility.py), so a later
+    swap pushes the hotkey out of `eligible` entirely, which resets its streak by
+    the identity rule, rather than carrying it forward under a new strategy.
+
+    King is read from chain so every validator anchors to the SAME incumbent
+    (consensus is shared; local Elo is not). On a consensus-read failure the king
+    is unknown, so we return {} and let the prior on-chain weights stand; we never
+    fall back to the local Elo leader, which would have each validator crown its
+    own argmax and diverge.
+
+    The streak advances at most once per tempo: `current_tempo` is checked against
+    the persisted tempo so a mid-tempo restart (which re-sets weights for an
+    already-processed tempo) does not re-increment it. The downstream
+    real_strategies filter still applies, so a defending king that isn't competing
+    this epoch drops to empty weights and the prior weights stand.
+    """
+    incumbent = _incumbent_king(sub, netuid)
+    if incumbent is None:
+        return {}
+    king_elo = elo.ratings.get(incumbent, elo.initial)
+    # Top contender = highest-Elo eligible miner other than the reigning king.
+    rated = [hk for hk in eligible if hk in elo.ratings and hk != incumbent]
+    contender = max(rated, key=lambda hk: (elo.ratings[hk], hk)) if rated else None
+    above = contender is not None and elo.ratings[contender] >= king_elo + margin
+
+    state = _load_koth()
+    if state.get("tempo") != current_tempo:  # new tempo: advance the streak once
+        if above and state.get("challenger") == contender:
+            state["streak"] = int(state.get("streak", 0)) + 1
+        elif above:  # new challenger hotkey -> fresh streak at 1
+            state.update(challenger=contender, streak=1)
+        else:        # nobody above the line this epoch -> reset
+            state.update(challenger=None, streak=0)
+        state["tempo"] = current_tempo
+        _save_koth(state)
+
+    if (above and state.get("challenger") == contender
+            and state.get("streak", 0) >= hold):
+        log.info(f"KOTH: {contender} dethrones {incumbent} "
+                 f"(led by >= {margin:.0f} Elo for {state['streak']} epochs)")
+        return {contender: 1.0}
+    return {incumbent: 1.0}
+
+
 def get_last_tempo() -> int:
     """Return the highest tempo_index already processed, or -1 if never."""
     try:
@@ -714,7 +816,7 @@ def main():
         if current_tempo <= last_tempo:
             log.info(f"tempo {current_tempo} already processed (last={last_tempo}); "
                      f"skipping tournament, reusing existing Elo for weights")
-            real_weights = elo.weights(cfg["elo"]["temperature"]) if elo.ratings else {}
+            real_weights = koth_weights(sub, netuid, elo, real_strategies, current_tempo)
         elif n_real >= 2:
             ok, err = llm.ping(cfg["game"]["model"])
             if not ok:
@@ -735,7 +837,7 @@ def main():
                     on_progress=lambda: last_progress.__setitem__(0, time.time()),
                 )
                 if results:
-                    real_weights = elo.weights(cfg["elo"]["temperature"])
+                    real_weights = koth_weights(sub, netuid, elo, real_strategies, current_tempo)
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
                     # is preferable in this order — on restart we'd skip the
                     # tournament (stale Elo) instead of double-counting matches.
@@ -753,21 +855,15 @@ def main():
         # commitment is rejected.
         real_weights = {hk: w for hk, w in real_weights.items()
                         if hk in real_strategies}
-        weights = assign_weights(records, real_weights, epoch_start_block)
-        if weights and not real_weights:
-            # Epsilon-only epoch: assign_weights returned EPS_BUDGET-tiny
-            # weights for placeholder miners, but no real Elo signal exists.
-            # Submitting these consumes the WeightsRateLimit window for nothing
-            # useful. Skip set_weights and let the prior epoch's weights stand
-            # on chain until a real tournament can run.
-            log.info(f"epsilon-only epoch ({len(weights)} placeholder miners, 0 real); "
-                     f"skipping set_weights to preserve rate-limit window")
-            sw_status = "skipped_epsilon_only"
-        elif weights:
+        weights = dict(real_weights)  # KOTH: king takes literally 100%; no epsilon carve-out
+        if weights:
             uids = [records[hk].uid for hk in weights]
             vals = list(weights.values())
             sw_status = "succeeded" if set_weights(sub, wallet, netuid, uids, vals) else "failed"
         else:
+            # No king to weight this epoch: chain consensus was unreadable, or the
+            # reigning king isn't a currently-competing real miner. Leave the prior
+            # epoch's weights standing on chain rather than zeroing them out.
             log.info("no weights to set this epoch")
             sw_status = "skipped"
         last_progress[0] = time.time()  # set_weights / chain ops finished, watchdog should see it
