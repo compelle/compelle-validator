@@ -16,6 +16,8 @@ import httpx
 import requests
 from openai import OpenAI
 
+from compelle import provenance
+
 log = logging.getLogger(__name__)
 
 MAX_STRATEGY_BYTES = 65536
@@ -1187,11 +1189,14 @@ def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
     for round_num in range(1, num_rounds + 1):
         pairs = _swiss_pair_round(hotkeys, scores, color_diff, played,
                                   elo, round_num, tempo_index)
-        for (pro, con) in pairs:
+        for idx, (pro, con) in enumerate(pairs):
             log.info(f"swiss R{round_num} pair: pro={pro[:8]}… "
                      f"con={con[:8]}… pro_cd={color_diff[pro]:+d} "
                      f"con_cd={color_diff[con]:+d} pro_elo={elo.get(pro):.1f} "
                      f"con_elo={elo.get(con):.1f}")
+            provenance.log_game(epoch_start_block, round_num, idx, chosen_topic,
+                                pro, con, strategies[pro], strategies[con],
+                                elo.get(pro), elo.get(con))
         log.info(f"swiss R{round_num}/{num_rounds}: {len(pairs)} games")
 
         # Lockstep round: all games advance turn-by-turn in cross-game waves

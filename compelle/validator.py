@@ -19,6 +19,7 @@ from compelle.engine import (
 )
 from compelle.eligibility import fetch_records
 from compelle.intent_classifier import classify_records
+from compelle import provenance
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -798,6 +799,16 @@ def main():
             for hk, r in records.items() if r.is_real_and_clean
         }
         real_strategies = {hk: t for hk, t in real_strategies.items() if t.strip()}
+
+        if provenance.enabled():
+            for hk, r in records.items():
+                try:
+                    resolved = real_strategies.get(hk)
+                    if resolved is None:
+                        resolved = resolve_strategy(r.commitment_text)
+                    provenance.log_miner(epoch_start_block, r, resolved)
+                except Exception:
+                    pass
 
         n_real = len(real_strategies)
         n_eps = sum(1 for r in records.values() if r.is_placeholder)
