@@ -11,13 +11,13 @@
 
   "old_config": {
     "game": {
-      "model": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+      "model": "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE",
       "model_fallbacks": ["zai-org/GLM-5.1-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
       "judge_panel": [
-        "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE",
         "zai-org/GLM-5.1-TEE"
       ],
-      "judge_fallback_model": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+      "judge_fallback_model": "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE",
       "judge_max_tokens": 4096,
       "max_turns": 5,
       "max_tokens_per_turn": 3072,
