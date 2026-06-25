@@ -11,8 +11,8 @@
 
   "old_config": {
     "game": {
-      "model": "deepseek-ai/DeepSeek-V3.2-TEE",
-      "model_fallbacks": ["zai-org/GLM-5.1-TEE", "moonshotai/Kimi-K2.6-TEE", "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE"],
+      "model": "zai-org/GLM-5.2-TEE",
+      "model_fallbacks": ["zai-org/GLM-5.1-TEE", "MiniMaxAI/MiniMax-M2.5-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
       "thinking_models": ["deepseek-ai/DeepSeek-V3.2-TEE"],
       "judge_panel": [
         "deepseek-ai/DeepSeek-V3.2-TEE",
