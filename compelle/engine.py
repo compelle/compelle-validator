@@ -487,6 +487,15 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
     raise last  # type: ignore[misc]
 
 
+# Pro speaks first, so its opening _chat call has no prior turns. Sending a
+# model only a system message with no user turn makes many models (DeepSeek
+# included) return empty content about half the time, or parrot the missing
+# instruction scaffolding ("Just start speaking to your opponent", "just
+# begin..."). A single user kickoff fixes it. It seeds only the model-visible
+# history, never the stored transcript, so nothing leaks to viewers.
+_FIRST_TURN_KICKOFF = "The debate now begins. Present your opening argument directly."
+
+
 def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
                          on_progress=None, on_game_turn=None):
     """Play one Swiss round with cross-game turn-batching.
@@ -532,7 +541,10 @@ def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
         prompts[(idx, "Con")] = template.format(
             topic=motion, side="Con (opposed to the motion)",
             strategy=strategies[con], context=context, date=today)
-        histories[(idx, "Pro")] = []
+        # Pro opens; seed a kickoff user turn (see _FIRST_TURN_KICKOFF). Con's
+        # first turn already has Pro's opening as its user message, so only Pro
+        # needs the seed. The kickoff never enters transcripts[idx].
+        histories[(idx, "Pro")] = [{"role": "user", "content": _FIRST_TURN_KICKOFF}]
         histories[(idx, "Con")] = []
 
     for wave in range(max_turns * 2):
@@ -643,7 +655,10 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
         "Con": template.format(topic=motion, side="Con (opposed to the motion)",
                                strategy=strategy_con, context=context, date=today),
     }
-    histories = {"Pro": [], "Con": []}
+    # Pro opens; seed a kickoff user turn so the model has something to answer
+    # (empty history yields an empty or echoed first turn). Stays out of the
+    # transcript. See _FIRST_TURN_KICKOFF.
+    histories = {"Pro": [{"role": "user", "content": _FIRST_TURN_KICKOFF}], "Con": []}
     transcript: list = []
     start = time.time()
 
