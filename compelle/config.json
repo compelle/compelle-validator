@@ -13,6 +13,7 @@
     "game": {
       "model": "deepseek-ai/DeepSeek-V3.2-TEE",
       "model_fallbacks": ["zai-org/GLM-5.1-TEE", "moonshotai/Kimi-K2.6-TEE", "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE"],
+      "thinking_models": ["deepseek-ai/DeepSeek-V3.2-TEE"],
       "judge_panel": [
         "deepseek-ai/DeepSeek-V3.2-TEE",
         "zai-org/GLM-5.1-TEE"
@@ -20,7 +21,7 @@
       "judge_fallback_model": "deepseek-ai/DeepSeek-V3.2-TEE",
       "judge_max_tokens": 4096,
       "max_turns": 5,
-      "max_tokens_per_turn": 3072,
+      "max_tokens_per_turn": 4096,
       "temperature": 0.6,
       "allow_draws": false
     },

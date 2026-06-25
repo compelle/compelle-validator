@@ -138,7 +138,8 @@ def _extract_retry_after(exc: Exception) -> float | None:
 
 
 class LLM:
-    def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 60.0,
+                 thinking_models=None):
         # HTTP/1.1 with a keep-alive pool. We originally picked HTTP/2 to
         # multiplex many requests over fewer sockets (friendlier to Chutes'
         # per-IP throttle), but empirical head-to-head benchmarks showed
@@ -168,6 +169,11 @@ class LLM:
         )
         self.client = OpenAI(base_url=base_url, api_key=api_key,
                              http_client=http, max_retries=0)
+        # Models that take a chat_template_kwargs thinking flag (DeepSeek-V3.2 is
+        # hybrid: reasoning is off by default). For these we send extra_body to
+        # turn the trace on. It returns in reasoning_content, never in the answer
+        # content, so nothing leaks to viewers and there is nothing to strip.
+        self.thinking_models = set(thinking_models or ())
 
     def ping(self, model: str) -> tuple[bool, str]:
         try:
@@ -187,9 +193,11 @@ class LLM:
         for attempt in range(8):
             try:
                 _acquire_rate_token()
+                extra = ({"extra_body": {"chat_template_kwargs": {"thinking": True}}}
+                         if model in self.thinking_models else {})
                 r = self.client.chat.completions.create(
                     model=model, messages=full,
-                    max_tokens=max_tokens, temperature=temperature,
+                    max_tokens=max_tokens, temperature=temperature, **extra,
                 )
                 return r.choices[0].message.content or ""
             except Exception as e:

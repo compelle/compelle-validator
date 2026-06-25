@@ -675,7 +675,8 @@ def main():
     cfg = load_config()
     wallet, api_key = _preflight(cfg)
     netuid = cfg["netuid"]
-    llm = LLM(cfg["chutes_api_url"], api_key)
+    llm = LLM(cfg["chutes_api_url"], api_key,
+              thinking_models=(cfg.get("old_config") or cfg)["game"].get("thinking_models", []))
     elo = load_elo(
         default_k=cfg["old_config"]["elo"]["k_factor"],
         default_initial=cfg["old_config"]["elo"]["initial_rating"],
