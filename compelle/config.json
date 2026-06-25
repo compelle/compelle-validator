@@ -13,7 +13,7 @@
     "game": {
       "model": "zai-org/GLM-5.2-TEE",
       "model_fallbacks": ["zai-org/GLM-5.1-TEE", "MiniMaxAI/MiniMax-M2.5-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
-      "thinking_models": ["deepseek-ai/DeepSeek-V3.2-TEE"],
+      "thinking_models": [],
       "judge_panel": [
         "deepseek-ai/DeepSeek-V3.2-TEE",
         "zai-org/GLM-5.1-TEE"
