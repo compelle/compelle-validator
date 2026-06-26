@@ -21,7 +21,7 @@
       "judge_fallback_model": "deepseek-ai/DeepSeek-V3.2-TEE",
       "judge_max_tokens": 4096,
       "max_turns": 5,
-      "max_tokens_per_turn": 4096,
+      "max_tokens_per_turn": 3072,
       "temperature": 0.6,
       "allow_draws": false
     },
