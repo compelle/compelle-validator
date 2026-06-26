@@ -195,6 +195,22 @@ class LLM:
         except Exception as e:
             return False, str(e)
 
+    def ping_chain(self, models: list[str]) -> tuple[bool, str, str]:
+        """Ping each model in order; succeed on the first that answers.
+
+        Returns (ok, working_model, last_error). Lets the validator start a
+        tournament whenever ANY model in the failover chain is reachable,
+        instead of skipping the whole epoch when only the primary is at
+        capacity. Per-game _chat handles routing once the tournament runs.
+        """
+        last_err = ""
+        for m in models:
+            ok, err = self.ping(m)
+            if ok:
+                return True, m, ""
+            last_err = err
+        return False, "", last_err
+
     def chat(self, system, messages, model, max_tokens=2048, temperature=0.6) -> str:
         full = [{"role": "system", "content": system}] + messages
         timeout_attempts = 0

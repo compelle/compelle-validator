@@ -266,6 +266,43 @@ def test_breaker_probe_failure_grows_cooldown(fast, breaker):
     assert llm.client.token_budgets.count(1) == 2
 
 
+# --- Preflight chain ---------------------------------------------------------
+# Business rule: the epoch preflight must gate on the whole failover chain, not
+# the primary alone. A 429 on the primary while a fallback is reachable must NOT
+# skip the tournament (that was burning whole epochs during a primary-only
+# capacity crunch); only a total outage (every model down) skips the round.
+
+
+def test_ping_chain_starts_on_first_reachable_fallback(fast):
+    # Primary and the first fallback are at capacity; the chain proceeds on the
+    # first model that answers, so the epoch runs instead of being skipped.
+    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
+    llm = _llm({"glm": ("raise", exc), "glm51": ("raise", exc), "deepseek": ("ok", "pong")})
+    ok, working, last = llm.ping_chain(["glm", "glm51", "deepseek"])
+    assert (ok, working) == (True, "deepseek")
+    assert llm.client.calls == ["glm", "glm51", "deepseek"]
+
+
+def test_ping_chain_prefers_primary_when_up(fast):
+    # If the primary answers, the chain stops there (one ping) and reports it as
+    # the working model, so "prefer the primary if it is up" holds at preflight.
+    llm = _llm({"glm": ("ok", "pong"), "deepseek": ("ok", "pong")})
+    ok, working, last = llm.ping_chain(["glm", "deepseek"])
+    assert (ok, working) == (True, "glm")
+    assert llm.client.calls == ["glm"]
+
+
+def test_ping_chain_fails_only_on_total_outage(fast):
+    # Every model down -> preflight fails and the validator skips the epoch (the
+    # deliberate, non-wasteful behavior); the last error is surfaced upward.
+    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
+    llm = _llm({"glm": ("raise", exc), "deepseek": ("raise", exc)})
+    ok, working, last = llm.ping_chain(["glm", "deepseek"])
+    assert ok is False
+    assert working == ""
+    assert "429" in last
+
+
 def test_breaker_never_skips_without_a_fallback(fast, breaker):
     # With no fallback there is nowhere to skip to, so the breaker is bypassed
     # and the primary is tried on every call.

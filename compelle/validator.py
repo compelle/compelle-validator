@@ -830,17 +830,25 @@ def main():
                      f"skipping tournament, reusing existing Elo for weights")
             real_weights = koth_weights(sub, netuid, elo, real_strategies, current_tempo)
         elif n_real >= 2:
-            ok, err = llm.ping(cfg["game"]["model"])
+            # Preflight the whole failover chain, not just the primary: a 429 on
+            # the primary alone must not skip the epoch when a fallback is
+            # reachable. Only a total outage (every model down) skips the round;
+            # per-game _chat then routes within the tournament.
+            chain = [cfg["game"]["model"], *cfg["game"].get("model_fallbacks", [])]
+            ok, working, err = llm.ping_chain(chain)
             if not ok:
-                log.warning(f"LLM preflight failed: {err[:200]}")
+                log.warning(f"LLM preflight failed (all {len(chain)} models down): {err[:200]}")
                 # Surface Chutes 402 quota reset timestamps in health.json so the
-                # operator sees when inference resumes. We don't sleep here —
-                # the next epoch loop will naturally re-preflight.
+                # operator sees when inference resumes. We don't sleep here; the
+                # next epoch loop will naturally re-preflight.
                 reset_iso = parse_quota_reset(err) if "402" in err else None
                 if reset_iso:
                     last_chutes_quota_reset_at = reset_iso
                     log.error(f"Chutes quota exhausted; reset_at={reset_iso}")
             else:
+                if working != chain[0]:
+                    log.warning(f"LLM preflight: primary {chain[0]} unavailable; "
+                                f"running this epoch on fallback {working}")
                 results, elo = run_tournament(
                     llm, cfg, real_strategies, epoch_start_block, elo=elo,
                     # Pulse the watchdog after each completed game so a long
