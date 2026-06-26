@@ -41,6 +41,10 @@ class FakeClient:
         kind, payload = self.by_model[model]
         if kind == "raise":
             raise payload
+        if kind == "seq":
+            # A sequence of responses for one model: pop until the last remains,
+            # so ('seq', ['', 'answer']) returns '' once then 'answer' after.
+            payload = payload.pop(0) if len(payload) > 1 else payload[0]
         return _resp(payload)
 
 
@@ -142,6 +146,61 @@ def test_timeout_path_still_retries_three_times(fast):
     with pytest.raises(Exception):
         llm.chat("sys", MSGS, "glm")
     assert llm.client.calls == ["glm", "glm", "glm"]
+
+
+# --- Empty-completion handling ----------------------------------------------
+# Business rule: a 200 carrying blank content is not a usable turn (provider
+# hiccup, or a reasoning model that emitted only hidden reasoning_content). It
+# raises no exception, so it used to be stored as an empty turn (the "broken
+# opening" / blank mid-debate turn on the site). It must be treated like any
+# other transient failure: re-roll the same model once (empties are
+# intermittent), then fall over to the next model, then label the game a void.
+
+
+def test_chat_re_rolls_same_model_on_empty_then_returns_content(fast):
+    # The common case: a one-off blank. One same-model re-roll lands content, so
+    # we keep the primary's voice instead of falling over on the first blip.
+    llm = _llm({"glm": ("seq", ["", "real opening"])})
+    assert llm.chat("sys", MSGS, "glm") == "real opening"
+    assert llm.client.calls == ["glm", "glm"]
+
+
+def test_chat_gives_up_on_persistent_empty_after_cap(fast):
+    # Whitespace-only counts as empty (it is .strip() that decides), and a model
+    # that never produces content is abandoned after the cap, not looped forever.
+    llm = _llm({"glm": ("ok", "   ")})
+    assert llm.chat("sys", MSGS, "glm") == ""
+    assert llm.client.calls == ["glm"] * engine._MAX_EMPTY_ATTEMPTS
+
+
+def test_chat_fails_over_when_primary_only_returns_empty(fast):
+    # Primary blank to exhaustion -> fall to the healthy fallback rather than
+    # store an empty turn. The primary is tried (its empty cap) before the over.
+    llm = _llm({"glm": ("ok", ""), "qwen": ("ok", "fallback answer")})
+    out = _chat(llm, "sys", MSGS, "glm", ["qwen"], 256, 0.6)
+    assert out == "fallback answer"
+    assert llm.client.calls == ["glm"] * engine._MAX_EMPTY_ATTEMPTS + ["qwen"]
+
+
+def test_chat_raises_when_every_model_returns_empty(fast):
+    # All models blank -> _chat raises so the round loop labels the game a void
+    # ("LLM error: empty completion ...") instead of recording a blank turn.
+    llm = _llm({"glm": ("ok", ""), "qwen": ("ok", "  ")})
+    with pytest.raises(Exception) as ei:
+        _chat(llm, "sys", MSGS, "glm", ["qwen"], 256, 0.6)
+    assert "empty completion" in str(ei.value)
+
+
+def test_empty_completions_open_the_primary_breaker(fast, breaker):
+    # A primary that keeps returning blank content is degraded exactly like one
+    # that keeps raising: it must feed the same breaker, so after the threshold
+    # the primary is skipped straight to the fallback (no per-call empty tax).
+    llm = _llm({"glm": ("ok", ""), "qwen": ("ok", "fallback")})
+    for _ in range(3):
+        assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
+    glm_calls = llm.client.calls.count("glm")
+    assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
+    assert llm.client.calls.count("glm") == glm_calls  # breaker OPEN: GLM skipped
 
 
 # --- Primary circuit breaker -------------------------------------------------

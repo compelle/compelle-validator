@@ -60,6 +60,13 @@ _MAX_TIMEOUT_ATTEMPTS = 3
 _CAPACITY_MARKERS = ("429", "too many requests", "rate limit",
                      "at capacity", "maximum capacity")
 _MAX_CAPACITY_ATTEMPTS = 1
+# A 200 response carrying blank content is not a usable turn (a provider hiccup,
+# or a reasoning model that spent its budget on hidden reasoning_content and
+# emitted nothing visible). It raises no exception, so without this path it was
+# silently stored as an empty turn: the "broken opening" / blank mid-debate turn
+# seen on the site. LLM.chat re-rolls the same model up to this many times
+# (empties are intermittent), then _chat falls over to the next model.
+_MAX_EMPTY_ATTEMPTS = 2
 _VERDICT_WORDS = {
     "PRO": "Pro", "PROPOSITION": "Pro", "PROP": "Pro", "YES": "Pro", "AFFIRMATIVE": "Pro",
     "CON": "Con", "OPPOSITION": "Con", "OPP": "Con", "NO": "Con", "NEGATIVE": "Con",
@@ -192,6 +199,7 @@ class LLM:
         full = [{"role": "system", "content": system}] + messages
         timeout_attempts = 0
         capacity_attempts = 0
+        empty_attempts = 0
         for attempt in range(8):
             try:
                 _acquire_rate_token()
@@ -201,7 +209,16 @@ class LLM:
                     model=model, messages=full,
                     max_tokens=max_tokens, temperature=temperature, **extra,
                 )
-                return r.choices[0].message.content or ""
+                content = r.choices[0].message.content or ""
+                if content.strip():
+                    return content
+                # Blank 200: re-roll the same model (empties are intermittent),
+                # then give up so _chat falls over to the next model.
+                empty_attempts += 1
+                if empty_attempts >= _MAX_EMPTY_ATTEMPTS:
+                    return ""
+                time.sleep(min(2 ** empty_attempts + random.random(), 8))
+                continue
             except Exception as e:
                 s = str(e).lower()
                 if any(m in s for m in _NOT_FOUND_MARKERS):
@@ -491,10 +508,21 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
                 continue
             raise
         else:
+            if out.strip():
+                if i == 0 and has_fallback and gate in ("use", "probe"):
+                    breaker.record(True)
+                return out
+            # Blank content survived LLM.chat's same-model retries. Treat it
+            # like a transient failure: penalize the primary breaker and fall
+            # over to the next model instead of storing an empty turn.
             if i == 0 and has_fallback and gate in ("use", "probe"):
-                breaker.record(True)
-            return out
-    raise last  # type: ignore[misc]
+                breaker.record(False)
+            last = RuntimeError(f"empty completion from {m}")
+            if m != models[-1]:
+                log.warning("model %s returned blank content, falling back", m)
+                continue
+            raise last
+    raise last or RuntimeError("no model produced output")  # type: ignore[misc]
 
 
 # Pro speaks first, so its opening _chat call has no prior turns. Sending a
