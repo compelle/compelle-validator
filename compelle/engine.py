@@ -617,7 +617,10 @@ def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
                 try:
                     raw = fut.result()
                 except Exception as e:
-                    outcomes[i] = ("draw", f"LLM error: {e}")
+                    # Infra failure across the whole fallback chain: void, not draw.
+                    # run_tournament drops voids from Elo and downstream W/L excludes
+                    # them, so a provider outage never scores as a real tie.
+                    outcomes[i] = ("void", f"LLM error: {e}")
                     if on_game_turn is not None:
                         try:
                             on_game_turn(idx=i, pair=pairs[i], side=side,
@@ -662,7 +665,7 @@ def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
                 try:
                     judge_results[i] = fut.result()
                 except Exception as e:
-                    outcomes[i] = ("draw", f"Judge error: {e}")
+                    outcomes[i] = ("void", f"Judge error: {e}")  # judge infra failure: void, not draw
         if on_progress is not None:
             try:
                 on_progress()
@@ -729,7 +732,7 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
                 raw = _chat(llm, prompts[side], histories[side], cfg["model"],
                             fallbacks, max_tok, temp)
             except Exception as e:
-                return _mk("draw", f"LLM error: {e}")
+                return _mk("void", f"LLM error: {e}")  # infra failure: void, not draw
             visible = strip_thinking(raw, tags)
             transcript.append({"speaker": side, "text": visible})
             histories[side].append({"role": "assistant", "content": visible})

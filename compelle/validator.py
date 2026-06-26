@@ -856,6 +856,19 @@ def main():
                     # under a fixed-wall-clock watchdog timeout.
                     on_progress=lambda: last_progress.__setitem__(0, time.time()),
                 )
+                # Games that hit infra failure across the whole fallback chain are
+                # voided (winner="void"): Elo-neutral, dropped from weights, never
+                # scored as draws. A high void rate means Chutes was largely down
+                # this epoch; log it loudly since the validator ships no Telegram of
+                # its own. Operators key monitoring off this marker in the log; the
+                # per-game winners are also in the epoch archive for after-the-fact
+                # inspection.
+                n_void = sum(1 for _, _, r in results if r.winner == "void")
+                if results and n_void / len(results) >= 0.10:
+                    log.error(f"HIGH VOID RATE: epoch {epoch} voided {n_void}/{len(results)} "
+                              f"games (provider outage); weights from {len(results) - n_void} completed")
+                elif n_void:
+                    log.warning(f"epoch {epoch}: {n_void}/{len(results)} games voided (infra)")
                 if results:
                     real_weights = koth_weights(sub, netuid, elo, real_strategies, current_tempo)
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
