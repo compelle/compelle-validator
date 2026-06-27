@@ -58,9 +58,11 @@ def fast(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_breaker():
-    # Per-model breakers are process-wide state; clear the registry before each
-    # test so neither it nor the pre-existing tests leak state across the suite.
+    # Per-model breakers and the adaptive-lead log state are process-wide; clear
+    # both before each test so neither they nor the pre-existing tests leak state
+    # across the suite.
     engine._breakers.clear()
+    engine._adaptive_lead.clear()
 
 
 @pytest.fixture
@@ -191,79 +193,26 @@ def test_chat_raises_when_every_model_returns_empty(fast):
     assert "empty completion" in str(ei.value)
 
 
-def test_empty_completions_open_the_primary_breaker(fast, breaker):
+def test_blank_completions_demote_the_primary(fast, breaker):
     # A primary that keeps returning blank content is degraded exactly like one
-    # that keeps raising: it must feed the same breaker, so after the threshold
-    # the primary is skipped straight to the fallback (no per-call empty tax).
+    # that keeps raising: each blank drops its health, so the adaptive selector
+    # demotes it below the healthy fallback and stops paying the per-call empty
+    # tax on it. (The health-ranking contract lives in test_adaptive_selector.py;
+    # this asserts blanks feed it, not just raised exceptions.)
     llm = _llm({"glm": ("ok", ""), "qwen": ("ok", "fallback")})
     for _ in range(3):
         assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
     glm_calls = llm.client.calls.count("glm")
     assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
-    assert llm.client.calls.count("glm") == glm_calls  # breaker OPEN: GLM skipped
+    assert llm.client.calls.count("glm") == glm_calls  # demoted: GLM no longer tried
 
 
-# --- Primary circuit breaker -------------------------------------------------
-# Business rule: a primary (GLM) that keeps failing must stop taxing every call.
-# After N consecutive failures the breaker opens and _chat skips the primary
-# straight to the fallback; it auto-recovers by probing with a cheap ping and
-# closes again when the primary answers. This keeps "prefer GLM if it is up"
-# while removing the per-call timeout tax when it is down.
-
-
-def test_breaker_opens_and_skips_primary_after_threshold(fast, breaker, engine_logs):
-    # Three consecutive primary failures (the threshold) trip the breaker; the
-    # next call must not touch the primary at all.
-    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
-    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "fallback")})
-    for _ in range(3):
-        assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
-    assert llm.client.calls.count("glm") == 3
-    # OPEN now: primary skipped, straight to the fallback.
-    assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "fallback"
-    assert llm.client.calls.count("glm") == 3      # GLM was not tried again
-    assert llm.client.calls[-1] == "qwen"
-    # The transition must be observable: opening is a single logged event, not
-    # a silent degrade (this is the whole point of the breaker on mainnet).
-    assert any("circuit breaker OPEN" in m for m in engine_logs)
-
-
-def test_breaker_recovers_via_cheap_ping(fast, breaker, engine_logs):
-    # Once the cooldown lapses the breaker half-opens; the next call probes with
-    # a one-token ping, and a healthy reply closes it so GLM is used again.
-    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
-    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "fallback")})
-    for _ in range(3):
-        _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6)       # open it
-    llm.client.by_model["glm"] = ("ok", "primary back")        # GLM recovers
-    breaker.advance(31)                                        # past the 30s cooldown
-    assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "primary back"
-    assert llm.client.token_budgets.count(1) == 1              # exactly one cheap ping
-    # Closed again: a later call uses GLM directly, no further ping.
-    assert _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6) == "primary back"
-    assert llm.client.token_budgets.count(1) == 1
-    # The probe and the recovery are both logged so an operator can see the
-    # breaker heal itself rather than infer it from the absence of warnings.
-    assert any("HALF-OPEN" in m for m in engine_logs)
-    assert any("circuit breaker CLOSED" in m for m in engine_logs)
-
-
-def test_breaker_probe_failure_grows_cooldown(fast, breaker):
-    # A failed recovery probe re-opens the breaker with a doubled cooldown, and
-    # no further probe fires until that longer window elapses.
-    exc = Exception("Error code: 429 - infrastructure is at maximum capacity")
-    llm = _llm({"glm": ("raise", exc), "qwen": ("ok", "fallback")})
-    for _ in range(3):
-        _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6)       # open @ 30s cooldown
-    breaker.advance(31)                                        # half-open
-    _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6)           # probe fails -> 60s cooldown
-    assert llm.client.token_budgets.count(1) == 1
-    breaker.advance(40)                                        # still inside the 60s window
-    _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6)           # still OPEN -> skip, no ping
-    assert llm.client.token_budgets.count(1) == 1
-    breaker.advance(25)                                        # past the 60s window
-    _chat(llm, "s", MSGS, "glm", ["qwen"], 256, 0.6)           # half-open again -> ping
-    assert llm.client.token_budgets.count(1) == 2
+# The debate-path circuit-breaker tests (open-after-threshold, recover-via-ping,
+# probe-failure-grows-cooldown) were replaced when _chat moved from the 3-strike
+# breaker to health-ranked failover: the debate path now demotes a flapping
+# primary by reliability EWMA and recovers it by time-decay, covered in
+# tests/test_adaptive_selector.py. The gate/probe/cooldown breaker itself is
+# unchanged and still exercised on the JUDGE path (test_judge_breaker_* below).
 
 
 # --- Preflight chain ---------------------------------------------------------

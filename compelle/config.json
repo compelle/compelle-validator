@@ -6,13 +6,14 @@
   "chutes_api_url": "https://llm.chutes.ai/v1",
   "config_gist_id": "60e5f11945a1f5582520e6d83eb615b2",
   "config_gist_owner": "compelle",
+  "config_models_gist_id": "463a5dcf4020c445306220107a0b26d5",
   "push_url": "https://compelle-ingest.compelle.workers.dev/ingest",
   "keep_epochs": 1000,
 
   "old_config": {
     "game": {
       "model": "zai-org/GLM-5.2-TEE",
-      "model_fallbacks": ["zai-org/GLM-5.1-TEE", "MiniMaxAI/MiniMax-M2.5-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
+      "model_fallbacks": ["Qwen/Qwen3-235B-A22B-Thinking-2507", "zai-org/GLM-5.1-TEE", "MiniMaxAI/MiniMax-M2.5-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"],
       "thinking_models": [],
       "judge_panel": [
         "deepseek-ai/DeepSeek-V3.2-TEE",

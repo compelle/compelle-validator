@@ -1,5 +1,11 @@
+import json
+
 from compelle.engine import strip_thinking, resolve_strategy, MAX_STRATEGY_BYTES
-from compelle.validator import _block_from_filename, _validate_topics, _next_cycle_sleep
+from compelle.validator import (
+    _block_from_filename, _validate_topics, _next_cycle_sleep,
+    _validate_models, _apply_overrides, fetch_config,
+)
+from compelle import validator as _validator
 
 
 def test_strip_thinking_removes_tagged_block():
@@ -101,3 +107,99 @@ def test_next_cycle_sleep_set_weights_failure_short_retry():
     # Even if the tournament ran long, failure still gets the short retry.
     assert _next_cycle_sleep(elapsed=100 * 60, epoch_seconds=4320,
                               sw_failed=True) == 60.0
+
+
+# --- gist-rotatable model list ----------------------------------------------
+# The model list is hot-editable from a hand-owned gist (separate from the
+# auto-refreshed topics gist) without a code redeploy. These tests encode the
+# rules: a malformed list is rejected whole (fail-closed), topics merge at the
+# top level while model keys nest under cfg["game"], and the gist passes the
+# model keys through validation untouched.
+
+
+def test_validate_models_accepts_valid():
+    assert _validate_models({"model": "glm", "model_fallbacks": ["qwen", "deepseek"]}) is True
+    assert _validate_models({"model": "glm"}) is True
+    assert _validate_models({"model_fallbacks": ["qwen"]}) is True
+
+
+def test_validate_models_accepts_no_model_keys():
+    # A topics-only gist carries no model keys; there is nothing to validate.
+    assert _validate_models({"topics": [{"motion": "x"}]}) is True
+
+
+def test_validate_models_rejects_empty_or_nonstring_model():
+    assert _validate_models({"model": "   "}) is False
+    assert _validate_models({"model": 42}) is False
+
+
+def test_validate_models_rejects_bad_fallbacks():
+    assert _validate_models({"model_fallbacks": "qwen"}) is False          # not a list
+    assert _validate_models({"model_fallbacks": []}) is False              # no failover left
+    assert _validate_models({"model_fallbacks": ["m"] * 13}) is False      # over MAX_FALLBACKS
+    assert _validate_models({"model_fallbacks": ["qwen", ""]}) is False    # blank entry
+    assert _validate_models({"model_fallbacks": ["qwen", 7]}) is False     # non-string entry
+
+
+def test_apply_overrides_topics_go_top_level():
+    cfg = {"game": {"model": "old"}, "topics": []}
+    _apply_overrides(cfg, {"topics": [{"motion": "new"}]})
+    assert cfg["topics"] == [{"motion": "new"}]
+    assert cfg["game"]["model"] == "old"  # game block untouched
+
+
+def test_apply_overrides_model_keys_nest_under_game():
+    cfg = {"game": {"model": "old", "model_fallbacks": ["a"], "max_turns": 5}}
+    _apply_overrides(cfg, {"model": "new", "model_fallbacks": ["b", "c"]})
+    assert cfg["game"]["model"] == "new"
+    assert cfg["game"]["model_fallbacks"] == ["b", "c"]
+    assert cfg["game"]["max_turns"] == 5  # other game keys untouched
+
+
+def test_apply_overrides_mixed_splits_correctly():
+    cfg = {"game": {"model": "old"}, "topics": []}
+    _apply_overrides(cfg, {"topics": [{"motion": "t"}], "model": "new"})
+    assert cfg["topics"] == [{"motion": "t"}]
+    assert cfg["game"]["model"] == "new"
+
+
+def _fake_gist(monkeypatch, content, owner="compelle"):
+    data = {
+        "history": [{"version": "abc123def456"}],
+        "owner": {"login": owner},
+        "files": {"models.json": {"content": content}},
+    }
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return data
+
+    monkeypatch.setattr(_validator.requests, "get", lambda *a, **k: _Resp())
+
+
+def test_fetch_config_passes_model_keys_through(monkeypatch):
+    content = json.dumps({"min_block": 0, "model": "primary-x",
+                          "model_fallbacks": ["fb-a", "fb-b"]})
+    _fake_gist(monkeypatch, content)
+    overrides, rev = fetch_config("gid", "compelle", 1000)
+    assert overrides == {"model": "primary-x", "model_fallbacks": ["fb-a", "fb-b"]}
+    assert rev == "abc123def456"
+
+
+def test_fetch_config_rejects_bad_model_list_fail_closed(monkeypatch):
+    # A malformed fallback list rejects the whole fetch so the loop keeps the
+    # last good list rather than running on a broken chain.
+    content = json.dumps({"min_block": 0, "model_fallbacks": "not-a-list"})
+    _fake_gist(monkeypatch, content)
+    overrides, _ = fetch_config("gid", "compelle", 1000)
+    assert overrides is None
+
+
+def test_fetch_config_models_gist_owner_guard(monkeypatch):
+    content = json.dumps({"model_fallbacks": ["fb-a"]})
+    _fake_gist(monkeypatch, content, owner="someone-else")
+    overrides, _ = fetch_config("gid", "compelle", 1000)
+    assert overrides is None

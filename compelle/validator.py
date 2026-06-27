@@ -72,8 +72,15 @@ def get_active_config(cfg: dict, block: int) -> dict:
 
 
 ROTATABLE_KEYS = {"topics"}
+# Model selection can also be rotated from a gist, but these keys live under
+# cfg["game"] (not at the top level), so _apply_overrides merges them there.
+# They ride in a separate, hand-edited gist kept apart from the auto-refreshed
+# topics gist: topic_refresh.patch_gist rewrites that file daily and would
+# clobber any model keys dropped into it.
+ROTATABLE_GAME_KEYS = {"model", "model_fallbacks"}
 MAX_TOPICS = 100
 MAX_TOPIC_BYTES = 4000
+MAX_FALLBACKS = 12
 
 
 VALID_FRAMINGS = {"direct", "probability", "market_trajectory"}
@@ -94,6 +101,35 @@ def _validate_topics(topics) -> bool:
             log.error(f"gist topic framing must be one of {VALID_FRAMINGS} or omitted")
             return False
     return True
+
+
+def _validate_models(parsed: dict) -> bool:
+    """Guard gist-supplied model selection. A bad list must be rejected whole so
+    fetch_config stays fail-closed (keep the last good list, ultimately the
+    bundled config.json default) rather than running on a malformed chain."""
+    if "model" in parsed:
+        if not isinstance(parsed["model"], str) or not parsed["model"].strip():
+            log.error("gist 'model' must be a non-empty string")
+            return False
+    if "model_fallbacks" in parsed:
+        fb = parsed["model_fallbacks"]
+        if not isinstance(fb, list) or not (1 <= len(fb) <= MAX_FALLBACKS):
+            log.error(f"gist 'model_fallbacks' must be a list of 1..{MAX_FALLBACKS} model ids")
+            return False
+        if not all(isinstance(x, str) and x.strip() for x in fb):
+            log.error("gist 'model_fallbacks' entries must be non-empty strings")
+            return False
+    return True
+
+
+def _apply_overrides(cfg: dict, overrides: dict) -> None:
+    """Merge gist overrides into the active config in place. Topic-level keys
+    (topics) land at the top; model keys nest under cfg['game']."""
+    for k, v in overrides.items():
+        if k in ROTATABLE_GAME_KEYS:
+            cfg.setdefault("game", {})[k] = v
+        else:
+            cfg[k] = v
 
 
 def fetch_config(gist_id: str, expected_owner: str, current_block: int) -> tuple[dict | None, str]:
@@ -128,7 +164,9 @@ def fetch_config(gist_id: str, expected_owner: str, current_block: int) -> tuple
             return None, revision
         if "topics" in parsed and not _validate_topics(parsed["topics"]):
             return None, revision
-        overrides = {k: v for k, v in parsed.items() if k in ROTATABLE_KEYS}
+        if not _validate_models(parsed):
+            return None, revision
+        overrides = {k: v for k, v in parsed.items() if k in ROTATABLE_KEYS | ROTATABLE_GAME_KEYS}
         return overrides, revision
     except Exception as e:
         log.error(f"config gist fetch failed: {e}")
@@ -708,9 +746,12 @@ def main():
 
     gist_id = cfg.get("config_gist_id", "")
     gist_owner = cfg.get("config_gist_owner", "")
+    models_gist_id = cfg.get("config_models_gist_id", "")
     keep_epochs = int(cfg.get("keep_epochs", 1000))
     cached_overrides: dict = {}
     cached_revision = "bundled"
+    cached_model_overrides: dict = {}
+    cached_model_revision = "bundled"
     epoch = 0
     # Most recent set_weights attempt — surfaced via data/health.json so
     # operators can monitor "is mine stuck?" without scraping logs.
@@ -758,14 +799,25 @@ def main():
             overrides, rev = fetch_config(gist_id, gist_owner, epoch_start_block)
             if overrides:
                 cached_overrides, cached_revision = overrides, rev
-        cfg.update(cached_overrides)
+        # The model list rides in a separate, hand-edited gist so the daily
+        # topics rewrite can never clobber it. Both fetches are fail-closed: a
+        # bad fetch keeps the last good values (ultimately config.json's bundle).
+        if models_gist_id:
+            m_over, m_rev = fetch_config(models_gist_id, gist_owner, epoch_start_block)
+            if m_over:
+                cached_model_overrides, cached_model_revision = m_over, m_rev
+        # Topics merge at the top level; model keys nest under cfg["game"]. Apply
+        # the models gist after the topics gist so the dedicated source wins.
+        _apply_overrides(cfg, cached_overrides)
+        _apply_overrides(cfg, cached_model_overrides)
 
         elo.k = cfg["elo"]["k_factor"]
         elo.initial = cfg["elo"]["initial_rating"]
 
         which = "new" if active is cfg.get("new_config") else "old"
         log.info(f"config: {which} ({len(cfg.get('topics', []))} topics, "
-                 f"gist_revision={cached_revision[:8]})")
+                 f"model={cfg['game']['model']}, gist_revision={cached_revision[:8]}, "
+                 f"models_gist={cached_model_revision[:8]})")
 
         # Commit-time intent classifier — pluggable, feature-flagged via cfg.
         intent_cfg = cfg.get("intent_classifier") or {}

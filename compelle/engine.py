@@ -202,14 +202,18 @@ class LLM:
         tournament whenever ANY model in the failover chain is reachable,
         instead of skipping the whole epoch when only the primary is at
         capacity. Per-game _chat handles routing once the tournament runs.
+        Models marked permanently dead (a prior 404) are skipped here too — we
+        do not ping a model the catalog has already told us does not exist.
         """
         last_err = ""
         for m in models:
+            if _breaker_for(m).dead:
+                continue
             ok, err = self.ping(m)
             if ok:
                 return True, m, ""
             last_err = err
-        return False, "", last_err
+        return False, "", last_err or "all models unavailable"
 
     def chat(self, system, messages, model, max_tokens=2048, temperature=0.6) -> str:
         full = [{"role": "system", "content": system}] + messages
@@ -381,28 +385,56 @@ class GameResult:
     judge_panel_votes: list = field(default_factory=list)
 
 
-# --- Primary-model circuit breaker -------------------------------------------
-# GLM (the configured primary) is preferred whenever it is healthy, but under a
-# Chutes capacity crunch it straddles our 90s read timeout: most calls still
-# complete, just slowly, so every _chat pays up to the full timeout on the
-# primary before falling over. Across a tournament that turns a ~50-minute run
-# into hours. The 429 fast-failover (see _CAPACITY_MARKERS) handles outright
-# rejection but not the slow-but-completing case. This breaker watches
-# consecutive primary failures (timeouts and capacity) and, once the primary is
-# clearly degraded, OPENS: _chat skips the primary and starts at the first
-# fallback for a cooldown window, so no call pays the primary's tax while it is
-# down. The cooldown grows exponentially as the primary keeps failing. When it
-# expires the breaker goes HALF-OPEN and the next call verifies recovery with a
-# cheap one-token ping (see LLM.ping); success CLOSES it (back to "prefer GLM"),
-# failure re-opens it with a longer cooldown. State is process-wide, like
-# _acquire_rate_token; one shared instance, GLM is the only primary in play.
+# --- Per-model circuit breaker -----------------------------------------------
+# A model is preferred whenever it is healthy, but under a Chutes capacity crunch
+# a model can straddle our 90s read timeout: most calls still complete, just
+# slowly, so a naive caller pays up to the full timeout before falling over.
+# Across a tournament that turns a ~50-minute run into hours. The 429 fast-
+# failover (see _CAPACITY_MARKERS) handles outright rejection but not the slow-
+# but-completing case. This breaker watches a model's consecutive failures
+# (timeouts and capacity) and, once it is clearly degraded, OPENS: callers skip
+# it for a cooldown window. The cooldown grows exponentially as it keeps failing.
+# When it expires the breaker goes HALF-OPEN and the next call verifies recovery
+# with a cheap one-token ping (see LLM.ping); success CLOSES it, failure re-opens
+# with a longer cooldown. State is process-wide, one breaker per model id (see
+# _breaker_for). The JUDGE path gates on this directly; the debate path consults
+# the reliability EWMA below instead (which the same record() calls also feed).
 _BREAKER_FAIL_THRESHOLD = 3      # consecutive primary failures before opening
 _BREAKER_BASE_COOLDOWN = 30.0    # seconds the primary is skipped on the first open
 _BREAKER_MAX_COOLDOWN = 300.0    # cap on the exponential cooldown growth
 
+# --- Adaptive model health (debate path ranking) -----------------------------
+# The breaker above is a short-memory gate: three strikes and the primary is
+# skipped for a cooldown, then bounced back the instant a cheap ping answers.
+# That is right for a one-off blip but wrong for a chronically flapping primary
+# (GLM-5.2 under a sustained Chutes brownout: blank storms + 90s timeouts that
+# intermittently succeed, so the breaker keeps closing and re-leading a model
+# that is still mostly broken while a healthy, faster fallback sits behind it).
+# The debate path therefore also keeps a longer-memory reliability EWMA per
+# model and ranks the failover chain by it: a model that has been failing sinks
+# below one that has been answering, so _chat automatically leads with the
+# reliable model (e.g. Qwen) without an operator touching config. The EWMA
+# decays back toward neutral when a model stops being called, so a recovered
+# model climbs back to the lead on its own. A 404 marks a model permanently
+# dead: it is dropped from the chain and never tried or pinged again.
+_HEALTH_NEUTRAL = 0.85           # reliability prior for a model we have not tried
+_HEALTH_ALPHA = 0.4              # EWMA weight on the newest outcome (one fail shows)
+_HEALTH_DECAY_HALFLIFE = 180.0   # seconds for the EWMA to drift halfway back to neutral
+_CONFIG_PRIOR_STEP = 0.05        # per-position bias keeping config order when health ties
+
 
 class _PrimaryBreaker:
-    """Thread-safe health gate for the configured primary model."""
+    """Thread-safe per-model health unit.
+
+    Carries two views of one model's health, fed by the same `record` calls:
+      - the short-memory circuit breaker (state / fails / cooldown) the JUDGE
+        path gates on via `gate()` — three strikes skip the model for a growing
+        cooldown, a cheap ping recovers it. Unchanged behavior.
+      - a long-memory reliability EWMA (`health`, `score`) the DEBATE path ranks
+        the failover chain by, plus a permanent `dead` flag for 404s. This is
+        what lets _chat lead with whichever model has been reliable lately
+        instead of bouncing back to a flapping primary.
+    """
 
     def __init__(self, threshold: int, base_cooldown: float, max_cooldown: float):
         self._threshold = threshold
@@ -414,6 +446,9 @@ class _PrimaryBreaker:
         self._opens = 0            # consecutive opens, drives backoff growth
         self._open_until = 0.0     # monotonic deadline of the current cooldown
         self._probing = False      # a half-open recovery probe is in flight
+        self._dead = False         # permanently unavailable (404); dropped from the chain
+        self._ok = _HEALTH_NEUTRAL # reliability EWMA in [0, 1]
+        self._ok_at = 0.0          # monotonic time of the last EWMA update (0 = never)
 
     def gate(self) -> str:
         """Return "use" (try the primary normally), "probe" (it may have
@@ -431,12 +466,38 @@ class _PrimaryBreaker:
                 return "probe"
             return "skip"
 
-    def record(self, ok: bool) -> None:
-        """Report a primary outcome (a real call while closed, or the ping while
-        half-open). Closes on success; opens or re-opens with a growing cooldown
-        on failure. Failures that arrive after the breaker already opened (stale
-        in-flight calls) are ignored so they do not inflate the backoff."""
+    def _decayed_locked(self, now: float) -> float:
+        """EWMA decayed toward neutral by the time since the last update. Caller
+        holds the lock. A model nobody has called drifts back to neutral so a
+        recovered model becomes eligible to lead again without live traffic."""
+        if self._ok_at == 0.0:
+            return _HEALTH_NEUTRAL
+        elapsed = max(0.0, now - self._ok_at)
+        factor = 0.5 ** (elapsed / _HEALTH_DECAY_HALFLIFE)
+        return _HEALTH_NEUTRAL + (self._ok - _HEALTH_NEUTRAL) * factor
+
+    def record(self, ok: bool, permanent: bool = False) -> None:
+        """Report a model outcome (a real call while closed, or the ping while
+        half-open). Updates the reliability EWMA, then drives the circuit
+        breaker: closes on success; opens or re-opens with a growing cooldown on
+        failure. Failures that arrive after the breaker already opened (stale
+        in-flight calls) are ignored so they do not inflate the backoff.
+        `permanent=True` (a 404) marks the model dead and short-circuits the
+        rest: a dead model is never tried, ranked, or pinged again."""
         with self._lock:
+            if permanent:
+                self._dead = True
+                return
+            now = time.monotonic()
+            sample = 1.0 if ok else 0.0
+            blended = (1 - _HEALTH_ALPHA) * self._decayed_locked(now) + _HEALTH_ALPHA * sample
+            # Cap at neutral: health is a demerit signal. A model is neutral when
+            # it behaves and drops below when it fails; success only restores it
+            # toward neutral, never above. This keeps a reliable fallback from
+            # pumping its score past the configured primary, so once the primary
+            # recovers it reclaims the lead on the config-order prior alone.
+            self._ok = min(_HEALTH_NEUTRAL, blended)
+            self._ok_at = now
             if ok:
                 if self._state != "closed":
                     log.info("primary circuit breaker CLOSED: primary recovered")
@@ -454,8 +515,27 @@ class _PrimaryBreaker:
                 return
             self._state = "open"
             cooldown = min(self._base * (2 ** (self._opens - 1)), self._max)
-            self._open_until = time.monotonic() + cooldown
+            self._open_until = now + cooldown
             log.warning("primary circuit breaker OPEN: skipping primary for %.0fs", cooldown)
+
+    @property
+    def dead(self) -> bool:
+        return self._dead
+
+    def health(self, now: float | None = None) -> float:
+        """Current decayed reliability EWMA in [0, 1]. Higher = more reliable."""
+        with self._lock:
+            return self._decayed_locked(time.monotonic() if now is None else now)
+
+    def score(self, config_prior: float, now: float | None = None) -> float:
+        """Ranking score for the debate chain: decayed reliability plus a small
+        config-order prior (keeps config order when health ties). A dead model
+        scores -inf so it sorts out of the chain entirely. Reads `dead` without
+        the lock (atomic bool) and takes the lock once inside `health`, so it
+        never nests locks."""
+        if self._dead:
+            return float("-inf")
+        return self.health(now) + config_prior
 
 
 # One breaker per model id, created on first use. A model's health is shared
@@ -476,46 +556,91 @@ def _breaker_for(model: str) -> _PrimaryBreaker:
         return b
 
 
+# Last-known lead model per configured primary, so the adaptive selector logs a
+# lead change once per transition instead of on every degraded call (10 workers
+# x many turns would bury the log during exactly the brownout an operator is
+# trying to read). Best-effort: a racing duplicate line is harmless.
+_adaptive_lead: dict = {}
+
+
+def _rank(models: list[str]) -> list[str]:
+    """Order the failover chain by live model health, dropping dead models.
+
+    `models` arrives in config order (primary first). Each non-dead model scores
+    its decayed reliability EWMA plus a small per-position prior, so equal health
+    preserves config order but a model that has been failing sinks below a
+    healthier one — that is how the debate path leads with the reliable model
+    (e.g. Qwen) while the configured primary flaps, and hands the lead back once
+    the primary recovers. Dead (404) models are removed entirely; the debate path
+    never asks for them again. An empty return means every model is dead."""
+    now = time.monotonic()
+    scored = []
+    n = len(models)
+    for idx, m in enumerate(models):
+        b = _breaker_for(m)
+        if b.dead:
+            continue
+        scored.append((b.score(_CONFIG_PRIOR_STEP * (n - idx), now), idx, m))
+    scored.sort(key=lambda t: (-t[0], t[1]))  # health desc, config order breaks ties
+    return [m for _, _, m in scored]
+
+
 def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
     """Try `primary` first, then each fallback. Falls back on:
       - ModelNotAvailableError (404 / unknown model)
       - persistent throttling (429) or upstream outage (503/502/504) — these
         are exhausted by `LLM.chat`'s internal retry first, so by the time we
         catch one here the primary has already burned its retries.
-    The primary circuit breaker (above) may skip the primary outright while it
-    is degraded, or verify recovery with a cheap ping before reusing it.
+    The failover chain is ordered by live health (see _rank): a model that has
+    been failing sinks below a healthier one, so the lead automatically moves to
+    the reliable model (e.g. Qwen) while the configured primary flaps, and hands
+    back to the primary once it recovers. Every attempt feeds that model's
+    health, so the order self-corrects call by call.
     """
-    models = [primary] + [m for m in fallbacks if m != primary]
+    models = _rank([primary] + [m for m in fallbacks if m != primary])
+    if not models:
+        raise ModelNotAvailableError(
+            f"every model in the failover chain is permanently unavailable "
+            f"(primary={primary}, fallbacks={fallbacks})")
     has_fallback = len(models) > 1
-    # Consult the breaker only when there is a fallback to skip to.
-    breaker = _breaker_for(primary)
-    gate = breaker.gate() if has_fallback else "use"
+    lead = models[0]
+    if _adaptive_lead.get(primary) != lead:
+        _adaptive_lead[primary] = lead
+        if primary not in models:
+            log.warning("adaptive selector: primary %s unavailable, leading with %s", primary, lead)
+        elif lead != primary:
+            log.warning("adaptive selector: primary %s degraded, leading with %s", primary, lead)
+        else:
+            log.info("adaptive selector: primary %s leads the chain", primary)
     last: Exception | None = None
     for i, m in enumerate(models):
-        if i == 0 and gate == "skip":
-            continue
-        if i == 0 and gate == "probe":
-            # Cheap recovery check: a one-token ping, no retry, so the probe
-            # costs about a second when the primary is back and at most one
-            # read-timeout when it is still down, never a full retry budget.
+        h = _breaker_for(m)
+        # Probationary lead: a model that climbed back to the front purely by
+        # health decay (still below neutral, i.e. it failed recently) gets a
+        # cheap one-token reality check before we risk a full debate-turn call
+        # and its read-timeout on it. A bad ping re-demotes it for ~free; only a
+        # healthy ping lets the real call proceed.
+        if i == 0 and has_fallback and h.health() < _HEALTH_NEUTRAL:
             try:
                 ok, _ = llm.ping(m)
             except Exception:
-                ok = False  # a raising ping must still clear the half-open prober
-            breaker.record(ok)
+                ok = False  # a raising ping must not strand us on the probe
+            h.record(ok)
             if not ok:
+                log.warning("model %s recovery probe failed, falling back", m)
+                last = RuntimeError(f"probe failed for {m}")
                 continue
         try:
             out = llm.chat(system, history, m, max_tok, temp)
         except ModelNotAvailableError as e:
-            if i == 0 and has_fallback and gate in ("use", "probe"):
-                breaker.record(False)
-            log.warning("model %s unavailable, falling back", m)
+            # 404 / unknown model: gone from the catalog. Mark it permanently
+            # dead so _rank drops it from every future call — never asked again.
+            h.record(False, permanent=True)
+            log.warning("model %s unavailable (404), dropping from the chain permanently", m)
             last = e
             continue
         except Exception as e:
-            if i == 0 and has_fallback and gate in ("use", "probe"):
-                breaker.record(False)
+            h.record(False)
             s = str(e).lower()
             transient = any(c in s for c in _TRANSIENT_MARKERS)
             if transient and m != models[-1]:
@@ -525,14 +650,12 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
             raise
         else:
             if out.strip():
-                if i == 0 and has_fallback and gate in ("use", "probe"):
-                    breaker.record(True)
+                h.record(True)
                 return out
             # Blank content survived LLM.chat's same-model retries. Treat it
-            # like a transient failure: penalize the primary breaker and fall
-            # over to the next model instead of storing an empty turn.
-            if i == 0 and has_fallback and gate in ("use", "probe"):
-                breaker.record(False)
+            # like a transient failure: penalize health and fall over to the next
+            # model instead of storing an empty turn.
+            h.record(False)
             last = RuntimeError(f"empty completion from {m}")
             if m != models[-1]:
                 log.warning("model %s returned blank content, falling back", m)
@@ -808,10 +931,15 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
     own Chutes queue, typically the debater primary):
       - the per-model circuit breaker (see _breaker_for): if this judge model
         is already known degraded, attempt 0 skips straight to the fallback, or
-        cheap-pings to verify recovery first.
+        cheap-pings to verify recovery first. A judge model marked permanently
+        dead (a prior 404) is likewise routed to the fallback.
       - a failed attempt 0: attempt 1 retries on the fallback.
     Without `judge_fallback_model` configured there is no breaker, and attempt 1
     repeats the original model (legacy behavior).
+
+    Unlike the debate path, the panel is NOT reordered by health: each slot is a
+    distinct vote and reshuffling would collapse panel diversity. The only
+    adaptive move here is dropping a dead model to the fallback.
 
     Diversity rationale: even when the fallback fires, the panel still gets one
     vote per slot. Falling through to a single different model beats losing the
@@ -830,11 +958,13 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
     # budget on a call that will fail. Only meaningful when a fallback exists.
     breaker = _breaker_for(judge_model) if fallback_model else None
     gate = breaker.gate() if breaker else "use"
+    judge_dead = bool(breaker and breaker.dead)
     for attempt in range(2):
-        # Attempt 0 normally uses the judge model; the breaker may redirect it
-        # to the fallback (skip) or verify recovery with a cheap ping (probe).
-        # Attempt 1 is the fallback model, sidestepping per-model throttling.
-        if attempt == 0 and gate == "skip":
+        # Attempt 0 normally uses the judge model; a dead model or an open
+        # breaker redirects it to the fallback (skip), or a half-open breaker
+        # verifies recovery with a cheap ping (probe). Attempt 1 is the fallback
+        # model, sidestepping per-model throttling.
+        if attempt == 0 and (judge_dead or gate == "skip"):
             model_to_use = fallback_model
         elif attempt == 0 and gate == "probe":
             try:
@@ -854,6 +984,16 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
                 [{"role": "user", "content": prompt}],
                 model_to_use, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
             )
+        except ModelNotAvailableError as e:
+            # 404: mark whichever model we actually called permanently dead so it
+            # is dropped everywhere (this judge slot next time, and the debate
+            # path), then fall through to the fallback / give up.
+            _breaker_for(model_to_use).record(False, permanent=True)
+            log.warning("judge model %s unavailable (404), dropping permanently: %s",
+                        model_to_use, str(e)[:80])
+            if attempt == 1:
+                return None
+            continue
         except Exception as e:
             if breaker and attempt == 0 and model_to_use == judge_model and gate in ("use", "probe"):
                 breaker.record(False)
