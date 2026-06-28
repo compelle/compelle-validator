@@ -563,13 +563,15 @@ def _incumbent_king(sub, netuid):
         return None
 
 
-def koth_weights(sub, netuid, elo, eligible, current_tempo,
+def koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
                  margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS):
     """Winner-take-all king of the hill.
 
     King = highest consensus weight last epoch. A challenger is crowned only if it
-    holds Elo >= king + 200 for one day (20 consecutive epochs). The crowned king
-    takes literally 100%.
+    is GOOD-cleared by the intent classifier AND holds Elo >= king + 200 for one
+    day (20 consecutive epochs). The crowned king takes literally 100%. A PENDING
+    (unresolved) miner still competes and earns Elo, but cannot be crowned or
+    advance the dethrone streak; crown_eligible is that GOOD-only subset.
 
     The streak is keyed on hotkey, never on UID: UIDs recycle on deregistration,
     so a fresh miner could otherwise inherit a dead slot's streak. It resets to
@@ -596,8 +598,12 @@ def koth_weights(sub, netuid, elo, eligible, current_tempo,
     if incumbent is None:
         return {}
     king_elo = elo.ratings.get(incumbent, elo.initial)
-    # Top contender = highest-Elo eligible miner other than the reigning king.
-    rated = [hk for hk in eligible if hk in elo.ratings and hk != incumbent]
+    # Top contender = highest-Elo GOOD-cleared miner other than the reigning
+    # king. crown_eligible is the GOOD-only subset (not merely not-BAD): a
+    # PENDING strategy still plays and earns Elo but cannot be crowned or
+    # advance the streak, so a miner cannot stay deliberately unresolved to
+    # dodge a lockout while out-Eloing the king.
+    rated = [hk for hk in crown_eligible if hk in elo.ratings and hk != incumbent]
     contender = max(rated, key=lambda hk: (elo.ratings[hk], hk)) if rated else None
     above = contender is not None and elo.ratings[contender] >= king_elo + margin
 
@@ -852,6 +858,18 @@ def main():
         }
         real_strategies = {hk: t for hk, t in real_strategies.items() if t.strip()}
 
+        # Only GOOD-cleared strategies may win the crown. PENDING miners still
+        # PLAY (they're in real_strategies, earning Elo and re-classified each
+        # epoch), but a strategy the panel has not unanimously cleared cannot be
+        # crowned king or count as a challenger toward the dethrone streak.
+        # Taking 100% of emission is the strict gate; merely competing is the
+        # lenient one. Denies the throne to a miner who engineers PENDING (one
+        # panel timeout or dissent) to stay not-BAD while out-Eloing the king.
+        crown_eligible = {
+            hk: t for hk, t in real_strategies.items()
+            if records[hk].intent_verdict == "GOOD"
+        }
+
         if provenance.enabled():
             for hk, r in records.items():
                 try:
@@ -880,7 +898,7 @@ def main():
         if current_tempo <= last_tempo:
             log.info(f"tempo {current_tempo} already processed (last={last_tempo}); "
                      f"skipping tournament, reusing existing Elo for weights")
-            real_weights = koth_weights(sub, netuid, elo, real_strategies, current_tempo)
+            real_weights = koth_weights(sub, netuid, elo, crown_eligible, current_tempo)
         elif n_real >= 2:
             # Preflight the whole failover chain, not just the primary: a 429 on
             # the primary alone must not skip the epoch when a fallback is
@@ -922,7 +940,7 @@ def main():
                 elif n_void:
                     log.warning(f"epoch {epoch}: {n_void}/{len(results)} games voided (infra)")
                 if results:
-                    real_weights = koth_weights(sub, netuid, elo, real_strategies, current_tempo)
+                    real_weights = koth_weights(sub, netuid, elo, crown_eligible, current_tempo)
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
                     # is preferable in this order — on restart we'd skip the
                     # tournament (stale Elo) instead of double-counting matches.
