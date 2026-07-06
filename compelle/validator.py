@@ -524,17 +524,23 @@ KOTH_STATE_PATH = f"{DATA_DIR}/koth_state.json"
 
 
 def _load_koth() -> dict:
-    """King-of-the-hill streak state: {tempo, challenger, streak}. `tempo` is the
-    tempo index the streak was last advanced for, so a mid-tempo restart reuses
-    the stored decision instead of double-counting the same epoch."""
+    """King-of-the-hill streak state: {tempo, streaks: {hotkey: epochs}}. `tempo`
+    is the tempo index the streaks were last advanced for, so a mid-tempo restart
+    reuses the stored decision instead of double-counting the same epoch."""
     try:
         with open(KOTH_STATE_PATH) as f:
-            return json.load(f)
+            state = json.load(f)
     except FileNotFoundError:
-        return {"tempo": -1, "challenger": None, "streak": 0}
+        return {"tempo": -1, "streaks": {}}
     except Exception as e:
         log.warning(f"koth state load failed ({e}); starting fresh")
-        return {"tempo": -1, "challenger": None, "streak": 0}
+        return {"tempo": -1, "streaks": {}}
+    if "streaks" not in state:  # legacy single-challenger file: carry its streak over
+        chal = state.get("challenger")
+        state["streaks"] = {chal: int(state.get("streak", 0))} if chal else {}
+    state.pop("challenger", None)
+    state.pop("streak", None)
+    return state
 
 
 def _save_koth(state: dict) -> None:
@@ -571,16 +577,12 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
     is GOOD-cleared by the intent classifier AND holds Elo >= king + 200 for one
     day (20 consecutive epochs). The crowned king takes literally 100%. A PENDING
     (unresolved) miner still competes and earns Elo, but cannot be crowned or
-    advance the dethrone streak; crown_eligible is that GOOD-only subset.
+    advance a dethrone streak; crown_eligible is that GOOD-only subset.
 
-    The streak is keyed on hotkey, never on UID: UIDs recycle on deregistration,
-    so a fresh miner could otherwise inherit a dead slot's streak. It resets to
-    zero on any single epoch the top contender falls below the line, or if the
-    contender's hotkey changes. A miner can't swap its strategy mid-climb to
-    launder a streak: eligibility requires the commitment to land within
-    ELIGIBILITY_WINDOW_BLOCKS of registration (see eligibility.py), so a later
-    swap pushes the hotkey out of `eligible` entirely, which resets its streak by
-    the identity rule, rather than carrying it forward under a new strategy.
+    Every eligible hotkey above the line runs its own streak concurrently (two
+    contenders trading the top spot no longer reset each other). If several cross
+    the hold in the same epoch, the higher Elo at that epoch wins; an exact Elo
+    dead heat falls to hotkey byte-order, deterministic and replayable.
 
     King is read from chain so every validator anchors to the SAME incumbent
     (consensus is shared; local Elo is not). On a consensus-read failure the king
@@ -598,31 +600,26 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
     if incumbent is None:
         return {}
     king_elo = elo.ratings.get(incumbent, elo.initial)
-    # Top contender = highest-Elo GOOD-cleared miner other than the reigning
-    # king. crown_eligible is the GOOD-only subset (not merely not-BAD): a
-    # PENDING strategy still plays and earns Elo but cannot be crowned or
-    # advance the streak, so a miner cannot stay deliberately unresolved to
-    # dodge a lockout while out-Eloing the king.
-    rated = [hk for hk in crown_eligible if hk in elo.ratings and hk != incumbent]
-    contender = max(rated, key=lambda hk: (elo.ratings[hk], hk)) if rated else None
-    above = contender is not None and elo.ratings[contender] >= king_elo + margin
+    above = {hk for hk in crown_eligible
+             if hk != incumbent and hk in elo.ratings
+             and elo.ratings[hk] >= king_elo + margin}
 
     state = _load_koth()
-    if state.get("tempo") != current_tempo:  # new tempo: advance the streak once
-        if above and state.get("challenger") == contender:
-            state["streak"] = int(state.get("streak", 0)) + 1
-        elif above:  # new challenger hotkey -> fresh streak at 1
-            state.update(challenger=contender, streak=1)
-        else:        # nobody above the line this epoch -> reset
-            state.update(challenger=None, streak=0)
+    if state.get("tempo") != current_tempo:  # new tempo: advance each streak once
+        prev = state.get("streaks", {})
+        state["streaks"] = {hk: int(prev.get(hk, 0)) + 1 for hk in above}
         state["tempo"] = current_tempo
         _save_koth(state)
 
-    if (above and state.get("challenger") == contender
-            and state.get("streak", 0) >= hold):
-        log.info(f"KOTH: {contender} dethrones {incumbent} "
-                 f"(led by >= {margin:.0f} Elo for {state['streak']} epochs)")
-        return {contender: 1.0}
+    crossers = [hk for hk, n in state.get("streaks", {}).items()
+                if n >= hold and hk in above]
+    if crossers:
+        winner = max(crossers, key=lambda hk: (elo.ratings[hk], hk))
+        log.info(f"KOTH: {winner} dethrones {incumbent} "
+                 f"(held >= +{margin:.0f} Elo for {state['streaks'][winner]} epochs"
+                 + (f"; Elo tiebreak over {len(crossers) - 1} co-crosser(s))"
+                    if len(crossers) > 1 else ")"))
+        return {winner: 1.0}
     return {incumbent: 1.0}
 
 

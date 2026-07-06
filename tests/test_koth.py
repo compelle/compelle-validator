@@ -79,3 +79,43 @@ def test_streak_resets_if_challenger_drops_to_pending(monkeypatch, tmp_path):
     validator.koth_weights(None, 82, elo, full, 3, hold=3)      # streak 1 again
     out = validator.koth_weights(None, 82, elo, full, 4, hold=3)  # streak 2 -> still king
     assert out == {KING: 1.0}
+
+
+RIVAL = "5Riva"
+
+
+def test_rival_flip_does_not_reset_a_streak(monkeypatch, tmp_path):
+    # Two GOOD contenders above the line trade the top Elo spot every epoch.
+    # Under the old single-slot rule each flip reset the other and neither
+    # could ever crown; per-hotkey streaks tick independently, so the hold
+    # completes anyway.
+    elo = _elo({KING: 1500.0, GOOD: 1800.0, RIVAL: 1790.0})
+    monkeypatch.setattr(validator, "KOTH_STATE_PATH", str(tmp_path / "koth.json"))
+    monkeypatch.setattr(validator, "_incumbent_king", lambda sub, netuid: KING)
+    pool = {KING: "k", GOOD: "g", RIVAL: "r"}
+    for t in range(3):
+        # alternate who leads; both stay above king + 200
+        elo.ratings[GOOD], elo.ratings[RIVAL] = ((1800.0, 1790.0) if t % 2 == 0
+                                                 else (1790.0, 1800.0))
+        out = validator.koth_weights(None, 82, elo, pool, t, hold=3)
+    # both crossed on the same epoch; higher Elo at that epoch takes the crown
+    assert out == {GOOD: 1.0}
+
+
+def test_simultaneous_crossers_broken_by_higher_elo(monkeypatch, tmp_path):
+    elo = _elo({KING: 1500.0, GOOD: 1900.0, RIVAL: 1800.0})
+    pool = {KING: "k", GOOD: "g", RIVAL: "r"}
+    out = _run(monkeypatch, tmp_path, elo, pool, range(3), hold=3)
+    assert out == {GOOD: 1.0}
+
+
+def test_legacy_state_file_carries_streak_over(monkeypatch, tmp_path):
+    # A pre-multistreak koth_state.json ({challenger, streak}) must seed the
+    # per-hotkey map, so a live climb is not zeroed by the deploy.
+    path = tmp_path / "koth.json"
+    path.write_text('{"tempo": 5, "challenger": "5Good", "streak": 2}')
+    monkeypatch.setattr(validator, "KOTH_STATE_PATH", str(path))
+    monkeypatch.setattr(validator, "_incumbent_king", lambda sub, netuid: KING)
+    elo = _elo({KING: 1500.0, GOOD: 1800.0})
+    out = validator.koth_weights(None, 82, elo, {KING: "k", GOOD: "g"}, 6, hold=3)
+    assert out == {GOOD: 1.0}  # 2 carried + this epoch = 3
