@@ -109,6 +109,22 @@ def test_simultaneous_crossers_broken_by_higher_elo(monkeypatch, tmp_path):
     assert out == {GOOD: 1.0}
 
 
+def test_longer_streak_beats_higher_elo(monkeypatch, tmp_path):
+    # Seniority dominates among crossers: RIVAL clears the hold two epochs
+    # before GOOD, so RIVAL keeps the claim even when GOOD leads on Elo. A
+    # late twin with a lucky Elo spike must not jump the queue.
+    elo = _elo({KING: 1500.0, RIVAL: 1800.0})
+    monkeypatch.setattr(validator, "KOTH_STATE_PATH", str(tmp_path / "koth.json"))
+    monkeypatch.setattr(validator, "_incumbent_king", lambda sub, netuid: KING)
+    pool = {KING: "k", GOOD: "g", RIVAL: "r"}
+    for t in range(2):  # RIVAL alone above the line: streak 1, 2
+        validator.koth_weights(None, 82, elo, pool, t, hold=3)
+    elo.ratings[GOOD] = 1900.0  # GOOD crosses late, with the higher Elo
+    for t in range(2, 5):  # RIVAL reaches 3, 4, 5; GOOD reaches 1, 2, 3
+        out = validator.koth_weights(None, 82, elo, pool, t, hold=3)
+    assert out == {RIVAL: 1.0}
+
+
 def test_legacy_state_file_carries_streak_over(monkeypatch, tmp_path):
     # A pre-multistreak koth_state.json ({challenger, streak}) must seed the
     # per-hotkey map, so a live climb is not zeroed by the deploy.

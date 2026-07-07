@@ -580,9 +580,10 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
     advance a dethrone streak; crown_eligible is that GOOD-only subset.
 
     Every eligible hotkey above the line runs its own streak concurrently (two
-    contenders trading the top spot no longer reset each other). If several cross
-    the hold in the same epoch, the higher Elo at that epoch wins; an exact Elo
-    dead heat falls to hotkey byte-order, deterministic and replayable.
+    contenders trading the top spot no longer reset each other). If several have
+    cleared the hold, seniority dominates: the longest streak wins; equal streaks
+    fall to higher Elo at that epoch, then hotkey byte-order, deterministic and
+    replayable.
 
     King is read from chain so every validator anchors to the SAME incumbent
     (consensus is shared; local Elo is not). On a consensus-read failure the king
@@ -614,10 +615,11 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
     crossers = [hk for hk, n in state.get("streaks", {}).items()
                 if n >= hold and hk in above]
     if crossers:
-        winner = max(crossers, key=lambda hk: (elo.ratings[hk], hk))
+        winner = max(crossers,
+                     key=lambda hk: (state["streaks"][hk], elo.ratings[hk], hk))
         log.info(f"KOTH: {winner} dethrones {incumbent} "
                  f"(held >= +{margin:.0f} Elo for {state['streaks'][winner]} epochs"
-                 + (f"; Elo tiebreak over {len(crossers) - 1} co-crosser(s))"
+                 + (f"; seniority/Elo tiebreak over {len(crossers) - 1} co-crosser(s))"
                     if len(crossers) > 1 else ")"))
         return {winner: 1.0}
     return {incumbent: 1.0}
