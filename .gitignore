@@ -9,3 +9,5 @@ data/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# Tests are for local development only, not part of the deployed validator.
+tests/

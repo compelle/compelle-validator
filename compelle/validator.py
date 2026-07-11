@@ -14,8 +14,8 @@ import bittensor as bt
 import requests
 
 from compelle.engine import (
-    LLM, Elo, run_tournament, resolve_strategy, _GIST_REVISIONED_RE,
-    parse_quota_reset,
+    LLM, Elo, run_tournament, run_title_fight, resolve_strategy,
+    _GIST_REVISIONED_RE, parse_quota_reset,
 )
 from compelle.eligibility import fetch_records
 from compelle.intent_classifier import classify_records
@@ -171,6 +171,63 @@ def fetch_config(gist_id: str, expected_owner: str, current_block: int) -> tuple
     except Exception as e:
         log.error(f"config gist fetch failed: {e}")
     return None, ""
+
+
+def _recent_unique_motions(gist_id: str, owner: str, n: int,
+                           max_revisions: int = 40) -> list:
+    """The most-recent `n` unique debate motions across the topics gist revision
+    history, newest first. The topics gist is rewritten daily, so its history is
+    a growing archive; walking it newest-first and deduping by motion yields a
+    stable, rotating pool every validator reconstructs identically (same gist,
+    same revisions). Used only for the title fight, so a larger topic set than
+    the ~10 live rotation topics.
+
+    Only the most-recent `max_revisions` are walked: one GitHub call per revision,
+    so an unbounded walk over months of daily revisions would blow the 60 req/hr
+    unauthenticated budget. A per-revision fetch error stops the walk but keeps
+    what was already collected rather than discarding it, so a mid-walk rate limit
+    still yields a usable pool. Fail-closed: returns [] on the initial gist/owner
+    error so the caller falls back to the thin live set."""
+    if not gist_id:
+        return []
+    headers = {}
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"token {token}"
+    try:
+        r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log.warning(f"title-fight topic pool fetch failed: {e}")
+        return []
+    if owner and (data.get("owner") or {}).get("login", "") != owner:
+        log.warning("title-fight topic pool: gist owner mismatch")
+        return []
+    seen, motions = set(), []
+    for h in (data.get("history") or [])[:max_revisions]:
+        rev_url = h.get("url")
+        if not rev_url:
+            continue
+        try:
+            rr = requests.get(rev_url, headers=headers, timeout=10)
+            rr.raise_for_status()
+            files = rr.json().get("files") or {}
+            if len(files) != 1:
+                continue
+            parsed = json.loads(next(iter(files.values())).get("content", "") or "")
+        except Exception as e:
+            log.warning(f"title-fight topic pool: revision fetch stopped early ({e}); "
+                        f"using {len(motions)} motions collected so far")
+            break
+        for t in (parsed.get("topics") or []):
+            m = (t.get("motion") or "").strip()
+            if m and m not in seen:
+                seen.add(m)
+                motions.append(t)
+                if len(motions) >= n:
+                    return motions
+    return motions
 
 
 def _within_rate_limit(sub, netuid: int, my_uid: int) -> int:
@@ -569,60 +626,190 @@ def _incumbent_king(sub, netuid):
         return None
 
 
-def koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
-                 margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS):
-    """Winner-take-all king of the hill.
+KOTH_TAIL_EPOCHS = 5      # epochs a deposed king keeps a 5% sliver after a crown flip
+KOTH_FIGHT_TOPICS = 100   # most-recent unique motions the fight is played on (x2 seats = 200 games)
+KOTH_FIGHT_ALPHA = 0.01   # crown only if the win count is significant at this level under a fair coin
+KOTH_FIGHT_MIN_DECIDED = 80  # power floor: fewer decided games than this -> inconclusive, king holds
 
-    King = highest consensus weight last epoch. A challenger is crowned only if it
-    is GOOD-cleared by the intent classifier AND holds Elo >= king + 200 for one
-    day (20 consecutive epochs). The crowned king takes literally 100%. A PENDING
-    (unresolved) miner still competes and earns Elo, but cannot be crowned or
-    advance a dethrone streak; crown_eligible is that GOOD-only subset.
 
-    Every eligible hotkey above the line runs its own streak concurrently (two
-    contenders trading the top spot no longer reset each other). If several have
-    cleared the hold, seniority dominates: the longest streak wins; equal streaks
-    fall to higher Elo at that epoch, then hotkey byte-order, deterministic and
-    replayable.
+def _binom_crit(n: int, alpha: float = KOTH_FIGHT_ALPHA) -> int:
+    """Smallest win count W in n decided games whose one-sided binomial tail
+    P(X >= W) under a fair coin is <= alpha. At this bar an evenly-matched
+    challenger (each game a 50/50 toss) clears it at most `alpha` of the time,
+    independent of how many games this validator ran. A fixed win *fraction*
+    can't hold that constant: its false-positive rate drifts with n. The bar
+    filters variance, not skill: a clearly stronger challenger clears it easily;
+    only a coin-flip-equal one is held back."""
+    from math import comb
+    for w in range(n + 1):
+        tail = sum(comb(n, k) for k in range(w, n + 1)) / (2 ** n)
+        if tail <= alpha:
+            return w
+    return n + 1
 
-    King is read from chain so every validator anchors to the SAME incumbent
-    (consensus is shared; local Elo is not). On a consensus-read failure the king
-    is unknown, so we return {} and let the prior on-chain weights stand; we never
-    fall back to the local Elo leader, which would have each validator crown its
-    own argmax and diverge.
 
-    The streak advances at most once per tempo: `current_tempo` is checked against
-    the persisted tempo so a mid-tempo restart (which re-sets weights for an
-    already-processed tempo) does not re-increment it. The downstream
-    real_strategies filter still applies, so a defending king that isn't competing
-    this epoch drops to empty weights and the prior weights stand.
+def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
+                   margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS):
+    """Advance dethrone streaks and return (incumbent, challenger|None).
+
+    King = highest consensus weight last epoch, read from chain so every
+    validator anchors to the SAME incumbent (consensus is shared; local Elo is
+    not). A challenger that is GOOD-cleared by the intent classifier AND holds
+    Elo >= king + margin for `hold` consecutive epochs earns a title check
+    against the king; crossing the streak is the admission ticket, not the crown
+    (the head-to-head check settles it). Among several crossers seniority
+    dominates: longest streak, then higher Elo, then hotkey byte-order.
+
+    Streaks are held against a specific king; if the king changed since they were
+    last advanced they no longer mean what they claimed, so they reset. The
+    streak advances at most once per tempo (`current_tempo` vs the persisted
+    tempo) so a mid-tempo restart does not re-increment it. Returns (None, None)
+    on a chain-read failure so the prior on-chain weights stand.
     """
     incumbent = _incumbent_king(sub, netuid)
     if incumbent is None:
-        return {}
+        return None, None
+    state = _load_koth()
+    if state.get("king") not in (None, incumbent):  # king changed: streaks void
+        state["streaks"] = {}
+    state["king"] = incumbent
+
     king_elo = elo.ratings.get(incumbent, elo.initial)
     above = {hk for hk in crown_eligible
              if hk != incumbent and hk in elo.ratings
              and elo.ratings[hk] >= king_elo + margin}
-
-    state = _load_koth()
     if state.get("tempo") != current_tempo:  # new tempo: advance each streak once
         prev = state.get("streaks", {})
         state["streaks"] = {hk: int(prev.get(hk, 0)) + 1 for hk in above}
         state["tempo"] = current_tempo
-        _save_koth(state)
+    _save_koth(state)
 
     crossers = [hk for hk, n in state.get("streaks", {}).items()
                 if n >= hold and hk in above]
-    if crossers:
-        winner = max(crossers,
+    if not crossers:
+        return incumbent, None
+    challenger = max(crossers,
                      key=lambda hk: (state["streaks"][hk], elo.ratings[hk], hk))
-        log.info(f"KOTH: {winner} dethrones {incumbent} "
-                 f"(held >= +{margin:.0f} Elo for {state['streaks'][winner]} epochs"
-                 + (f"; seniority/Elo tiebreak over {len(crossers) - 1} co-crosser(s))"
-                    if len(crossers) > 1 else ")"))
-        return {winner: 1.0}
-    return {incumbent: 1.0}
+    return incumbent, challenger
+
+
+def _koth_reset_streak(hk: str) -> None:
+    """Zero a challenger's streak after it loses a title check, so it has to
+    re-earn the ticket rather than re-fight every epoch."""
+    state = _load_koth()
+    if hk in state.get("streaks", {}):
+        state["streaks"][hk] = 0
+        _save_koth(state)
+
+
+def _koth_cached_fight(current_tempo: int, challenger: str):
+    """Return the cached title-check result for (tempo, challenger), or None.
+    A set_weights retry reuses this instead of re-running the head-to-head."""
+    f = _load_koth().get("fight") or {}
+    if f.get("tempo") == current_tempo and f.get("challenger") == challenger:
+        return f.get("won")
+    return None
+
+
+def _koth_record_fight(current_tempo: int, challenger: str, incumbent: str,
+                       won: bool) -> None:
+    state = _load_koth()
+    state["fight"] = {"tempo": current_tempo, "challenger": challenger,
+                      "won": bool(won)}
+    if won:  # crown transfer: start the transition tail
+        state["reign"] = {"king": challenger, "prev": incumbent,
+                          "since": current_tempo, "won": True}
+    _save_koth(state)
+
+
+def _koth_apply_tail(weights: dict, current_tempo: int, competing) -> dict:
+    """95/5 transition tail: for KOTH_TAIL_EPOCHS after a crown flip, leave 5%
+    on the deposed king so a handover doesn't zero it in a single epoch."""
+    if len(weights) != 1:
+        return weights
+    (king, _w), = weights.items()
+    reign = _load_koth().get("reign") or {}
+    if reign.get("king") != king:
+        return weights
+    prev = reign.get("prev")
+    age = current_tempo - int(reign.get("since", current_tempo))
+    if prev and prev != king and prev in competing and 0 <= age < KOTH_TAIL_EPOCHS:
+        return {king: 0.95, prev: 0.05}
+    return weights
+
+
+def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
+                 config=None, strategies=None, workers=5, on_progress=None,
+                 may_fight=True, margin=KOTH_DEFENSE_MARGIN,
+                 hold=KOTH_DETHRONE_EPOCHS):
+    """Winner-take-all king of the hill. The king takes literally 100% (minus a
+    brief 5% transition sliver to the deposed king right after a flip).
+
+    A challenger that clears the dethrone streak earns a title check: a quick
+    head-to-head to confirm the new king actually beats the old king before the
+    crown transfers. It is crowned only if it wins that check. `may_fight=False`
+    (the retry path for an already-processed tempo) reuses a cached check result
+    instead of running fresh games. `strategies` is the currently-competing set;
+    if either fighter is not in it the king simply holds.
+    """
+    # Hold a freshly-crowned king through the transition tail so a consensus-read
+    # lag doesn't re-trigger the title check every epoch until the chain catches
+    # up to the new incumbent.
+    strategies = strategies or {}
+    reign = _load_koth().get("reign") or {}
+    if reign.get("won") and reign.get("king") in strategies:
+        age = current_tempo - int(reign.get("since", current_tempo))
+        if 0 <= age < KOTH_TAIL_EPOCHS:
+            return _koth_apply_tail({reign["king"]: 1.0}, current_tempo, strategies)
+
+    incumbent, challenger = koth_contender(sub, netuid, elo, crown_eligible,
+                                           current_tempo, margin=margin, hold=hold)
+    if incumbent is None:
+        return {}
+    if challenger is None:
+        return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
+
+    won = _koth_cached_fight(current_tempo, challenger)
+    if won is None:
+        if not may_fight or llm is None:
+            return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
+        if incumbent not in strategies or challenger not in strategies:
+            log.info(f"KOTH title check skipped: {'king' if incumbent not in strategies else 'challenger'} "
+                     f"not competing this epoch; king {incumbent[:8]}… holds")
+            return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
+        # Play on the most-recent KOTH_FIGHT_TOPICS unique motions (x2 seats),
+        # not the ~10 live rotation topics, for statistical power over a broad
+        # topic set. Fail-closed to the live set; the >=KOTH_FIGHT_MIN_DECIDED
+        # floor then holds the king.
+        topics = _recent_unique_motions((config or {}).get("config_gist_id", ""),
+                                        (config or {}).get("config_gist_owner", ""),
+                                        KOTH_FIGHT_TOPICS) or ((config or {}).get("topics") or [])
+        games = 2 * len(topics)
+        ch_wins, king_wins, decided = run_title_fight(
+            llm, config, incumbent, challenger, strategies, topics, workers,
+            on_progress=on_progress)
+        if decided < KOTH_FIGHT_MIN_DECIDED:  # too few decided (short pool or outage)
+            log.warning(f"KOTH title check inconclusive ({decided}/{games} decided, "
+                        f"floor {KOTH_FIGHT_MIN_DECIDED}); king holds, challenger keeps its streak")
+            return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
+        # Significance bar: crown only if the win count is unlikely for an
+        # evenly-matched challenger (each game a 50/50 toss) at KOTH_FIGHT_ALPHA.
+        # The bar scales with the decided count, so the false-positive rate stays
+        # ~alpha no matter how many games this validator ran.
+        need = _binom_crit(decided, KOTH_FIGHT_ALPHA)
+        won = ch_wins >= need
+        log.info(f"KOTH title check: challenger {ch_wins}/{decided} decided, "
+                 f"need {need} (alpha {KOTH_FIGHT_ALPHA}) -> {'CROWN' if won else 'hold'}")
+        _koth_record_fight(current_tempo, challenger, incumbent, won)
+        if won:
+            log.info(f"KOTH: {challenger} beat king {incumbent} {ch_wins}-{king_wins} in the title check; crown transfers")
+        else:
+            _koth_reset_streak(challenger)
+            log.info(f"KOTH: challenger {challenger[:8]}… lost the title check {ch_wins}-{king_wins}; king {incumbent[:8]}… holds, streak reset")
+
+    if won:
+        return _koth_apply_tail({challenger: 1.0}, current_tempo, strategies)
+    return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
 
 
 def get_last_tempo() -> int:
@@ -897,7 +1084,10 @@ def main():
         if current_tempo <= last_tempo:
             log.info(f"tempo {current_tempo} already processed (last={last_tempo}); "
                      f"skipping tournament, reusing existing Elo for weights")
-            real_weights = koth_weights(sub, netuid, elo, crown_eligible, current_tempo)
+            # Retry within an already-processed tempo: never run a fresh title
+            # check here; reuse the cached result (may_fight=False).
+            real_weights = koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
+                                        strategies=real_strategies, may_fight=False)
         elif n_real >= 2:
             # Preflight the whole failover chain, not just the primary: a 429 on
             # the primary alone must not skip the epoch when a fallback is
@@ -939,7 +1129,15 @@ def main():
                 elif n_void:
                     log.warning(f"epoch {epoch}: {n_void}/{len(results)} games voided (infra)")
                 if results:
-                    real_weights = koth_weights(sub, netuid, elo, crown_eligible, current_tempo)
+                    # Fresh tempo: a crossed challenger runs the title check here
+                    # (may_fight=True), using the same competing set and workers
+                    # as the tournament.
+                    real_weights = koth_weights(
+                        sub, netuid, elo, crown_eligible, current_tempo,
+                        llm=llm, config=cfg, strategies=real_strategies,
+                        workers=cfg["tournament"].get("max_concurrent_games", 5),
+                        on_progress=lambda: last_progress.__setitem__(0, time.time()),
+                        may_fight=True)
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
                     # is preferable in this order — on restart we'd skip the
                     # tournament (stale Elo) instead of double-counting matches.
@@ -957,7 +1155,7 @@ def main():
         # commitment is rejected.
         real_weights = {hk: w for hk, w in real_weights.items()
                         if hk in real_strategies}
-        weights = dict(real_weights)  # KOTH: king takes literally 100%; no epsilon carve-out
+        weights = dict(real_weights)  # KOTH: king takes ~100% (5% transition sliver to a just-deposed king); no broad epsilon carve-out
         if weights:
             uids = [records[hk].uid for hk in weights]
             vals = list(weights.values())

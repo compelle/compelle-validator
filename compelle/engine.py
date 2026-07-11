@@ -1327,6 +1327,53 @@ def _swiss_pair_round(hotkeys, scores, color_diff, played, elo, round_num,
     return pairs
 
 
+def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
+                    workers, on_progress=None):
+    """A quick final check that the new king actually beats the old king before
+    the crown transfers.
+
+    Every topic is played both ways (each fighter takes Pro on it once and Con
+    once), so the two sides get an equal number of Pro and Con seats and the
+    seat advantage cancels. Draws and infra voids are not counted either way.
+    Elo is not read or updated here. The caller applies the win bar: the win
+    count must be significant under a fair coin, so an evenly-matched challenger
+    (50/50 vs the king) almost never clears it on variance; the new king must
+    clearly beat the old one.
+
+    Why a match and not Elo alone: the crown is winner-take-all, so it should
+    turn on beating the sitting king head-to-head, the most direct merit test
+    there is, rather than on an Elo number accrued against the wider field. It
+    stays winnable: a clearly stronger challenger clears the bar easily; only a
+    coin-flip-equal one is held back. This head-to-head is also the verification
+    step sealed (private-strategy) commitments build on, where a challenge is
+    settled by match outcome without either strategy being made public.
+
+    Returns (ch_wins, king_wins, decided).
+    """
+    workers = max(1, workers)
+    ch_wins = king_wins = 0
+    for topic_obj in topics:
+        # (pro, con) both ways: challenger Pro then challenger Con.
+        pairs = [(challenger_hk, king_hk), (king_hk, challenger_hk)]
+        out = _play_round_lockstep(llm, config, pairs, topic_obj, strategies,
+                                   workers, on_progress=on_progress)
+        for _i, pro, con, gr in out:
+            if gr.winner == "Pro":
+                w = pro
+            elif gr.winner == "Con":
+                w = con
+            else:
+                continue  # draw or void: proves nothing, excluded
+            if w == challenger_hk:
+                ch_wins += 1
+            elif w == king_hk:
+                king_wins += 1
+    decided = ch_wins + king_wins
+    log.info(f"title check: challenger {challenger_hk[:8]}… {ch_wins}-{king_wins} "
+             f"king {king_hk[:8]}… ({decided}/{2 * len(topics)} decided)")
+    return ch_wins, king_wins, decided
+
+
 def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
                    on_progress=None, on_game_turn=None):
     hotkeys = list(strategies.keys())
