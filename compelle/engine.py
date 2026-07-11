@@ -1344,9 +1344,9 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
     turn on beating the sitting king head-to-head, the most direct merit test
     there is, rather than on an Elo number accrued against the wider field. It
     stays winnable: a clearly stronger challenger clears the bar easily; only a
-    coin-flip-equal one is held back. This head-to-head is also the verification
-    step sealed (private-strategy) commitments build on, where a challenge is
-    settled by match outcome without either strategy being made public.
+    coin-flip-equal one is held back. Deciding the crown on match results rather
+    than an Elo number is also the groundwork a future private-strategy
+    commitment scheme would build on.
 
     Returns (ch_wins, king_wins, decided).
     """
