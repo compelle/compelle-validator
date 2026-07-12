@@ -523,10 +523,15 @@ def save_elo(elo) -> None:
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = ELO_STATE_PATH + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"k": elo.k, "initial": elo.initial, "ratings": elo.ratings}, f)
+            json.dump({"k": elo.k, "initial": elo.initial, "ratings": elo.ratings,
+                       "commitments": getattr(elo, "commitments", {})}, f)
         os.replace(tmp, ELO_STATE_PATH)
     except Exception as e:
         log.warning(f"elo save failed: {e}")
+
+
+def _commitment_hash(text) -> str:
+    return hashlib.sha256((text or "").strip().encode()).hexdigest()
 
 
 def prune_stale_elo(elo, records) -> int:
@@ -559,6 +564,24 @@ def prune_stale_elo(elo, records) -> int:
     return len(to_remove)
 
 
+def prune_mismatched_elo(elo, records) -> list:
+    """Companion to prune_stale_elo: a persisted rating is only valid for the
+    commitment it was computed against; discard entries that no longer match."""
+    known = getattr(elo, "commitments", {})
+    stale = [hk for hk, h in known.items()
+             if hk in elo.ratings and hk in records
+             and _commitment_hash(records[hk].commitment_text) != h]
+    if stale:
+        koth = _load_koth()
+        for hk in stale:
+            del elo.ratings[hk]
+            del known[hk]
+            koth.get("streaks", {}).pop(hk, None)
+            log.info(f"pruned stale Elo entry (commitment mismatch): uid={records[hk].uid} hk={hk[:12]}")
+        _save_koth(koth)
+    return stale
+
+
 def load_elo(default_k: float, default_initial: float):
     """Load persisted Elo ratings; if missing/corrupt, return fresh."""
     try:
@@ -566,7 +589,9 @@ def load_elo(default_k: float, default_initial: float):
             d = json.load(f)
         e = Elo(k=d.get("k", default_k), initial=d.get("initial", default_initial))
         e.ratings = dict(d.get("ratings", {}))
-        log.info(f"loaded persisted Elo: {len(e.ratings)} hotkeys")
+        e.commitments = dict(d.get("commitments", {}))
+        log.info(f"loaded persisted Elo: {len(e.ratings)} hotkeys, "
+                 f"{len(e.commitments)} commitments")
         return e
     except FileNotFoundError:
         return Elo(k=default_k, initial=default_initial)
@@ -1108,6 +1133,7 @@ def main():
                 if working != chain[0]:
                     log.warning(f"LLM preflight: primary {chain[0]} unavailable; "
                                 f"running this epoch on fallback {working}")
+                prune_mismatched_elo(elo, records)
                 results, elo = run_tournament(
                     llm, cfg, real_strategies, epoch_start_block, elo=elo,
                     # Pulse the watchdog after each completed game so a long
@@ -1145,6 +1171,8 @@ def main():
                     n_pruned = prune_stale_elo(elo, records)
                     if n_pruned:
                         log.info(f"pruned {n_pruned} stale Elo entries (deregistered or malformed gist)")
+                    elo.commitments = {hk: _commitment_hash(records[hk].commitment_text)
+                                        for hk in elo.ratings if hk in records}
                     save_elo(elo)
 
         # Drop hotkeys whose CURRENT commitment doesn't resolve, even if they
