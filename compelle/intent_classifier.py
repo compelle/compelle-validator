@@ -381,6 +381,7 @@ def classify_records(
     parallel_workers: int = DEFAULT_PARALLEL,
     uid_parallel_workers: int = 6,
     thinking_tags: Optional[list[str]] = None,
+    on_progress=None,
 ) -> dict[str, IntentResult]:
     """Run classifier on every eligible non-placeholder miner record.
 
@@ -436,4 +437,10 @@ def classify_records(
         for fut in as_completed(futures):
             hk, res = fut.result()
             results[hk] = res
+            # Screening a strategy is completed work; let a caller pulse its
+            # watchdog so a slow (but progressing) screen isn't mistaken for a
+            # hang. On a throttled LLM account this phase can exceed the
+            # watchdog window even though every verdict is landing.
+            if on_progress is not None:
+                on_progress()
     return results

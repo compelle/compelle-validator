@@ -1050,6 +1050,7 @@ def main():
                     parallel_workers=int(intent_cfg.get("parallel_workers", 6)),
                     uid_parallel_workers=int(intent_cfg.get("uid_parallel_workers", 6)),
                     thinking_tags=cfg.get("thinking_tags"),
+                    on_progress=lambda: last_progress.__setitem__(0, time.time()),
                 )
                 for hk, res in intent_results.items():
                     records[hk].intent_verdict = res.verdict
