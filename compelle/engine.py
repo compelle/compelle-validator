@@ -22,6 +22,20 @@ log = logging.getLogger(__name__)
 
 MAX_STRATEGY_BYTES = 65536
 
+# Characters a reader can't see but a model can: the Unicode tag block,
+# zero-width spaces/joiners, directional marks, bidi embedding/override/isolate
+# controls, variation selectors, and the BOM. These are the covert-channel
+# surface. We reject rather than require ASCII because real strategies use
+# typographic punctuation (curly quotes, em dash) and the Greek delta that names
+# the concession move; blocking only the invisibles keeps those.
+_INVISIBLE_RE = re.compile(
+    "[\U000E0000-\U000E007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFE00-\uFE0F\uFEFF]")
+
+
+def plain_text_ok(text: str) -> bool:
+    """False if the text carries any invisible character."""
+    return not _INVISIBLE_RE.search(text)
+
 
 def topic_id(topic_obj: dict) -> str:
     """Stable, content-addressed ID for a topic. Hash of normalized motion text.
@@ -323,7 +337,9 @@ def _save_gist_cache() -> None:
 
 def resolve_strategy(commitment: str) -> str:
     if not commitment.startswith("gist:"):
-        return commitment if len(commitment.encode("utf-8")) <= MAX_STRATEGY_BYTES else ""
+        if len(commitment.encode("utf-8")) > MAX_STRATEGY_BYTES or not plain_text_ok(commitment):
+            return ""
+        return commitment
 
     m = _GIST_REVISIONED_RE.match(commitment)
     if not m:
@@ -359,6 +375,9 @@ def resolve_strategy(commitment: str) -> str:
             return ""
         content = next(iter(files.values())).get("content", "") or ""
         if len(content.encode("utf-8")) > MAX_STRATEGY_BYTES:
+            return ""
+        if not plain_text_ok(content):
+            log.warning(f"reject gist {commitment}: not plain text")
             return ""
         _gist_cache[cache_key] = content
         _save_gist_cache()
