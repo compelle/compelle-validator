@@ -278,6 +278,23 @@ def _judge_one(
         return PanelVote(model=model, verdict=None, reason=f"err: {str(e)[:80]}", raw_chars=0)
 
 
+def uncache(strategy: str) -> bool:
+    """Drop a strategy's cached verdict so the panel re-judges it next epoch.
+
+    Used by the validator's king fail-safe: a unanimous BAD on the sitting
+    king is demoted to PENDING rather than cached into a permanent lockout
+    (a false positive there would freeze the crown and its emissions with no
+    self-healing path). Returns True if an entry was removed.
+    """
+    _ensure_cache_loaded()
+    key = _hash(strategy)
+    if key in _cache:
+        del _cache[key]
+        _save_cache()
+        return True
+    return False
+
+
 def classify_strategy(
     strategy: str,
     llm: LLM,

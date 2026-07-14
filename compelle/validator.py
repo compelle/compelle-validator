@@ -18,7 +18,7 @@ from compelle.engine import (
     _GIST_REVISIONED_RE, parse_quota_reset,
 )
 from compelle.eligibility import fetch_records
-from compelle.intent_classifier import classify_records
+from compelle.intent_classifier import classify_records, uncache as intent_uncache
 from compelle import provenance
 
 
@@ -673,6 +673,30 @@ def _binom_crit(n: int, alpha: float = KOTH_FIGHT_ALPHA) -> int:
     return n + 1
 
 
+def king_failsafe(records, intent_results, king, resolve_fn) -> bool:
+    """Never auto-lock the sitting king. A BAD on the chain incumbent drops it
+    from real_strategies, which freezes the on-chain weights at {king: 1.0}
+    while blocking every title fight — a permanent, non-self-healing crown
+    deadlock if the verdict was a triple false positive. Demote to PENDING,
+    uncache so the panel re-judges next epoch, and log loudly so the operator
+    makes the lockout call. A genuinely dirty king is caught the epoch after
+    it is dethroned. Returns True when the fail-safe fired."""
+    king_rec = records.get(king) if king else None
+    if king_rec is None or king_rec.intent_verdict != "BAD":
+        return False
+    king_rec.intent_verdict = "PENDING"
+    try:
+        intent_uncache(resolve_fn(king_rec.commitment_text))
+    except Exception as e:
+        log.warning(f"king fail-safe uncache failed: {e}")
+    king_res = intent_results.get(king)
+    reasons = [v.reason for v in king_res.votes] if king_res else []
+    log.error(f"KING INTENT FAIL-SAFE: panel voted BAD on sitting king "
+              f"uid={king_rec.uid} hk={king[:12]}; demoted to PENDING, "
+              f"NOT locked. Operator review required. reasons={reasons}")
+    return True
+
+
 def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
                    margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS):
     """Advance dethrone streaks and return (incumbent, challenger|None).
@@ -1054,6 +1078,8 @@ def main():
                 )
                 for hk, res in intent_results.items():
                     records[hk].intent_verdict = res.verdict
+                king_failsafe(records, intent_results, _incumbent_king(sub, netuid),
+                              resolve_strategy)
                 n_bad = sum(1 for r in records.values() if r.intent_verdict == "BAD")
                 n_good = sum(1 for r in records.values() if r.intent_verdict == "GOOD")
                 n_pending = sum(1 for r in records.values() if r.is_real and r.intent_verdict == "PENDING")
