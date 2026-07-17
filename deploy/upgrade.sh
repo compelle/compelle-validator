@@ -54,9 +54,43 @@ echo "  current: $(git rev-parse --short HEAD) ($(git log -1 --format=%s))"
 echo "  target:  $(git rev-parse --short "$TARGET_REF") ($(git log -1 --format=%s "$TARGET_REF"))"
 echo
 
+# Venv health probe. The checkout can be at target while the venv is broken:
+# a failed/interrupted pip install, or scalecodec/cyscale namespace corruption
+# where pip metadata says "satisfied" but imports raise. Probe the exact
+# imports the validator needs plus the pyproject bittensor pin; when unhealthy,
+# force-repair and restart even if HEAD is already at target.
+venv_healthy() {
+    "$REPO_DIR/.venv/bin/python" - <<'PY' >/dev/null 2>&1
+import re, pathlib
+import bittensor
+from scalecodec import ScaleBytes
+from importlib.metadata import version
+pin = re.search(r'"bittensor==([^"]+)"', pathlib.Path("pyproject.toml").read_text())
+assert pin is None or version("bittensor") == pin.group(1)
+PY
+}
+
+repair_venv() {
+    echo "=== venv unhealthy; force-reinstalling deps ==="
+    "$REPO_DIR/.venv/bin/pip" uninstall -y scalecodec cyscale --quiet 2>/dev/null || true
+    "$REPO_DIR/.venv/bin/pip" install --force-reinstall -e . --quiet
+}
+
 if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$TARGET_REF")" ]; then
-    echo "already at target. Nothing to do."
-    exit 0
+    if venv_healthy; then
+        echo "already at target. Nothing to do."
+        exit 0
+    fi
+    repair_venv
+    if venv_healthy; then
+        echo "venv repaired; restarting $SERVICE"
+        systemctl restart "$SERVICE"
+        sleep 3
+        systemctl is-active "$SERVICE"
+        exit 0
+    fi
+    echo "venv repair FAILED — rebuild it: python3 -m venv --clear $REPO_DIR/.venv && $REPO_DIR/.venv/bin/pip install -e $REPO_DIR"
+    exit 1
 fi
 
 # Optional supply-chain hardening. Set COMPELLE_REQUIRE_SIGNED=1 in
@@ -99,6 +133,10 @@ echo "=== reinstall deps if pyproject changed ==="
 if git diff HEAD@{1} HEAD --name-only | grep -q pyproject.toml; then
     echo "pyproject.toml changed; running pip install"
     "$REPO_DIR/.venv/bin/pip" install -e . --quiet
+fi
+if ! venv_healthy; then
+    repair_venv
+    venv_healthy || echo "WARNING: venv still unhealthy after repair; service may fail to start"
 fi
 
 echo
