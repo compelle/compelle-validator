@@ -659,18 +659,21 @@ KOTH_FIGHT_ALPHA = 0.01   # crown only if the win count is significant at this l
 KOTH_FIGHT_MIN_DECIDED = 80  # power floor: fewer decided games than this -> inconclusive, king holds
 
 
-def _majority_burn_uid(sub, netuid, competing):
-    """UID to mirror when consensus argmax sits on a hotkey that is not a
-    competing miner AND holds a majority of the clipped consensus mass (the
-    signature of a stake-majority burn vote). None when consensus points at a
-    real miner, isn't majority-backed, or the read fails."""
+def _majority_burn_uid(sub, netuid):
+    """UID to mirror when consensus argmax sits on the SUBNET OWNER hotkey
+    with a majority of the clipped consensus mass (the signature of a
+    stake-majority burn vote). Owner-only on purpose: mirroring any other
+    non-competing argmax (e.g. a deregistered king's recycled UID) would pay
+    a squatter and reinforce the very artifact the mirror exists to survive.
+    None when consensus points anywhere else, isn't majority-backed, or the
+    read fails."""
     try:
+        owner = sub.query_subtensor("SubnetOwnerHotkey", params=[netuid])
+        owner = owner.value if hasattr(owner, "value") else owner
         mg = sub.metagraph(netuid, lite=True)
         top = max(range(len(mg.consensus)), key=lambda i: mg.consensus[i])
         share = float(mg.consensus[top]) / (float(sum(mg.consensus)) or 1.0)
-        if list(mg.hotkeys)[top] in (competing or {}):
-            return None
-        if share < 0.5:
+        if not owner or list(mg.hotkeys)[top] != owner or share < 0.5:
             return None
         return int(mg.uids[top])
     except Exception as e:
@@ -766,9 +769,14 @@ def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
                 _save_koth(state)
             rk = vac.get("king")
             if rk and rk in strategies and rk in crown_eligible and \
-                    vac.get("commit") in (None, (commitments or {}).get(rk)):
+                    vac.get("commit") is not None and \
+                    vac.get("commit") == (commitments or {}).get(rk):
                 # The king re-registered carrying the commitment it reigned
                 # with (a swapped strategy must re-earn the crown from zero).
+                # Fail closed: no stored hash means no reclaim; the vacancy
+                # timeout decides instead. A None wildcard would re-open the
+                # rereg strategy-swap exploit on any box whose elo state
+                # lacked the hash when the vacancy opened.
                 incumbent = rk
                 state.pop("vacancy", None)
             elif vac and current_tempo - int(vac.get("since", current_tempo)) >= KOTH_VACANCY_EPOCHS:
@@ -780,6 +788,7 @@ def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
                 state.pop("vacancy", None)
             else:
                 return None, None  # vacant: prior on-chain weights stand
+    state.pop("vacancy", None)  # any vacancy surviving to a crowned incumbent is stale
     if state.get("king") not in (None, incumbent):  # king changed: streaks void
         state["streaks"] = {}
     state["king"] = incumbent
@@ -1201,7 +1210,10 @@ def main():
             # Retry within an already-processed tempo: never run a fresh title
             # check here; reuse the cached result (may_fight=False).
             real_weights = koth_weights(sub, netuid, elo, crown_eligible, current_tempo,
-                                        strategies=real_strategies, may_fight=False)
+                                        strategies=real_strategies,
+                                        commitments={hk: _commitment_hash(records[hk].commitment_text)
+                                                     for hk in real_strategies},
+                                        may_fight=False)
         elif n_real >= 2:
             # Preflight the whole failover chain, not just the primary: a 429 on
             # the primary alone must not skip the epoch when a fallback is
@@ -1295,7 +1307,7 @@ def main():
             # the crown itself is never handed to the burn target.
             # Kill switch: COMPELLE_NO_BURN_MIRROR=1.
             if not os.environ.get("COMPELLE_NO_BURN_MIRROR"):
-                m_uid = _majority_burn_uid(sub, netuid, real_strategies)
+                m_uid = _majority_burn_uid(sub, netuid)
                 if m_uid is not None:
                     if set_weights(sub, wallet, netuid, [m_uid], [1.0]):
                         sw_status = "burn-mirror"
