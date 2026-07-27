@@ -652,9 +652,30 @@ def _incumbent_king(sub, netuid):
 
 
 KOTH_TAIL_EPOCHS = 5      # epochs a deposed king keeps a 5% sliver after a crown flip
+KOTH_VACANCY_EPOCHS = 40  # epochs a deregistered king's crown is held open for its
+                          # return before the top-rated eligible competitor is seated
 KOTH_FIGHT_TOPICS = 100   # most-recent unique motions the fight is played on (x2 seats = 200 games)
 KOTH_FIGHT_ALPHA = 0.01   # crown only if the win count is significant at this level under a fair coin
 KOTH_FIGHT_MIN_DECIDED = 80  # power floor: fewer decided games than this -> inconclusive, king holds
+
+
+def _majority_burn_uid(sub, netuid, competing):
+    """UID to mirror when consensus argmax sits on a hotkey that is not a
+    competing miner AND holds a majority of the clipped consensus mass (the
+    signature of a stake-majority burn vote). None when consensus points at a
+    real miner, isn't majority-backed, or the read fails."""
+    try:
+        mg = sub.metagraph(netuid, lite=True)
+        top = max(range(len(mg.consensus)), key=lambda i: mg.consensus[i])
+        share = float(mg.consensus[top]) / (float(sum(mg.consensus)) or 1.0)
+        if list(mg.hotkeys)[top] in (competing or {}):
+            return None
+        if share < 0.5:
+            return None
+        return int(mg.uids[top])
+    except Exception as e:
+        log.warning(f"majority-burn read failed: {e}")
+        return None
 
 
 def _binom_crit(n: int, alpha: float = KOTH_FIGHT_ALPHA) -> int:
@@ -698,7 +719,8 @@ def king_failsafe(records, intent_results, king, resolve_fn) -> bool:
 
 
 def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
-                   margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS):
+                   margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS,
+                   strategies=None, commitments=None):
     """Advance dethrone streaks and return (incumbent, challenger|None).
 
     King = highest consensus weight last epoch, read from chain so every
@@ -713,12 +735,51 @@ def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
     last advanced they no longer mean what they claimed, so they reset. The
     streak advances at most once per tempo (`current_tempo` vs the persisted
     tempo) so a mid-tempo restart does not re-increment it. Returns (None, None)
-    on a chain-read failure so the prior on-chain weights stand.
+    on a chain-read failure, and while the crown is vacant (deregistered king,
+    artifact argmax), so the prior on-chain weights stand.
     """
     incumbent = _incumbent_king(sub, netuid)
     if incumbent is None:
         return None, None
     state = _load_koth()
+    if strategies is not None and incumbent not in strategies:
+        # Consensus argmax on a non-competing hotkey is an artifact, not a
+        # crown move: a stake-majority burn vote parks it on the owner UID, and
+        # a deregistered king's recycled UID parks it on the squatter that took
+        # the slot (both observed 2026-07-27). An artifact must never displace
+        # the persisted king, void streaks, or crown the argmax hotkey.
+        prev = state.get("king")
+        vac = state.get("vacancy") or {}
+        if prev and prev in strategies and vac.get("king") != prev:
+            log.warning(f"KOTH: consensus argmax on non-competing hotkey "
+                        f"{incumbent[:8]}… (burn/squat artifact); king "
+                        f"{prev[:8]}… holds, streaks preserved")
+            incumbent = prev  # king still competing: artifact epoch, reign holds
+        else:
+            if prev and vac.get("king") != prev:
+                # The king left the metagraph: open a vacancy holding its last
+                # known commitment hash, so only the same strategy can reclaim.
+                vac = {"king": prev,
+                       "commit": (getattr(elo, "commitments", None) or {}).get(prev),
+                       "since": current_tempo}
+                state["vacancy"] = vac
+                _save_koth(state)
+            rk = vac.get("king")
+            if rk and rk in strategies and rk in crown_eligible and \
+                    vac.get("commit") in (None, (commitments or {}).get(rk)):
+                # The king re-registered carrying the commitment it reigned
+                # with (a swapped strategy must re-earn the crown from zero).
+                incumbent = rk
+                state.pop("vacancy", None)
+            elif vac and current_tempo - int(vac.get("since", current_tempo)) >= KOTH_VACANCY_EPOCHS:
+                # The king never came back: seat the top-rated eligible miner.
+                live = [hk for hk in crown_eligible if hk in strategies]
+                if not live:
+                    return None, None
+                incumbent = max(live, key=lambda hk: (elo.ratings.get(hk, elo.initial), hk))
+                state.pop("vacancy", None)
+            else:
+                return None, None  # vacant: prior on-chain weights stand
     if state.get("king") not in (None, incumbent):  # king changed: streaks void
         state["streaks"] = {}
     state["king"] = incumbent
@@ -788,8 +849,8 @@ def _koth_apply_tail(weights: dict, current_tempo: int, competing) -> dict:
 
 
 def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
-                 config=None, strategies=None, workers=5, on_progress=None,
-                 may_fight=True, margin=KOTH_DEFENSE_MARGIN,
+                 config=None, strategies=None, commitments=None, workers=5,
+                 on_progress=None, may_fight=True, margin=KOTH_DEFENSE_MARGIN,
                  hold=KOTH_DETHRONE_EPOCHS):
     """Winner-take-all king of the hill. The king takes literally 100% (minus a
     brief 5% transition sliver to the deposed king right after a flip).
@@ -812,7 +873,8 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
             return _koth_apply_tail({reign["king"]: 1.0}, current_tempo, strategies)
 
     incumbent, challenger = koth_contender(sub, netuid, elo, crown_eligible,
-                                           current_tempo, margin=margin, hold=hold)
+                                           current_tempo, margin=margin, hold=hold,
+                                           strategies=strategies, commitments=commitments)
     if incumbent is None:
         return {}
     if challenger is None:
@@ -1188,6 +1250,8 @@ def main():
                     real_weights = koth_weights(
                         sub, netuid, elo, crown_eligible, current_tempo,
                         llm=llm, config=cfg, strategies=real_strategies,
+                        commitments={hk: _commitment_hash(records[hk].commitment_text)
+                                     for hk in real_strategies},
                         workers=cfg["tournament"].get("max_concurrent_games", 5),
                         on_progress=lambda: last_progress.__setitem__(0, time.time()),
                         may_fight=True)
@@ -1216,11 +1280,26 @@ def main():
             vals = list(weights.values())
             sw_status = "succeeded" if set_weights(sub, wallet, netuid, uids, vals) else "failed"
         else:
-            # No king to weight this epoch: chain consensus was unreadable, or the
-            # reigning king isn't a currently-competing real miner. Leave the prior
-            # epoch's weights standing on chain rather than zeroing them out.
+            # No king to weight this epoch: chain consensus was unreadable, the
+            # reigning king isn't a currently-competing real miner, or the crown
+            # is vacant. Leave the prior epoch's weights standing on chain rather
+            # than zeroing them out.
             log.info("no weights to set this epoch")
             sw_status = "skipped"
+            # Majority-burn survival: when a stake-majority validator burn-votes
+            # the owner UID, every validator that disagrees earns vtrust 0 and
+            # emission 0 and walks toward the dereg queue head (2026-07-27:
+            # three validators queued and the king lost its slot to a cheap
+            # registration this way). Mirror the burn for exactly these artifact
+            # epochs to stay alive; koth_contender ignores artifact argmax, so
+            # the crown itself is never handed to the burn target.
+            # Kill switch: COMPELLE_NO_BURN_MIRROR=1.
+            if not os.environ.get("COMPELLE_NO_BURN_MIRROR"):
+                m_uid = _majority_burn_uid(sub, netuid, real_strategies)
+                if m_uid is not None:
+                    if set_weights(sub, wallet, netuid, [m_uid], [1.0]):
+                        sw_status = "burn-mirror"
+                        log.info(f"burn-mirror: matched majority burn on uid {m_uid} to preserve vtrust")
         last_progress[0] = time.time()  # set_weights / chain ops finished, watchdog should see it
         last_sw_block = epoch_start_block
         last_sw_status = sw_status
