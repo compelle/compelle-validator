@@ -278,6 +278,7 @@ def _judge_one(
             model,
             max_tokens=max_tokens,
             temperature=temperature,
+            tag="intent",
         )
         verdict, reason = _parse_verdict(raw, tags)
         return PanelVote(model=model, verdict=verdict, reason=reason, raw_chars=len(raw or ""))

@@ -87,6 +87,56 @@ _VERDICT_WORDS = {
     "AGAINST": "Con",
 }
 
+# Per-(tag, model) token totals, for a summary the caller logs. Tokens only,
+# never prices: the provider rotates them and a stale table would be wrong.
+_usage_lock = threading.Lock()
+_usage: dict = {}
+
+
+def record_usage(tag: str, model: str, usage) -> None:
+    """Fold one response's usage block into the per-(tag, model) totals."""
+    if usage is None:
+        return
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", 0) or 0
+    with _usage_lock:
+        row = _usage.setdefault((tag or "untagged", model),
+                                {"calls": 0, "prompt": 0, "cached": 0, "completion": 0})
+        row["calls"] += 1
+        row["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+        row["cached"] += cached
+        row["completion"] += getattr(usage, "completion_tokens", 0) or 0
+
+
+def usage_snapshot() -> dict:
+    """Copy of the totals, keyed (tag, model). Safe to call mid-tournament."""
+    with _usage_lock:
+        return {k: dict(v) for k, v in _usage.items()}
+
+
+def usage_reset() -> None:
+    with _usage_lock:
+        _usage.clear()
+
+
+def usage_lines() -> list:
+    """One log line per (tag, model), heaviest input first, plus a TOTAL."""
+    snap = usage_snapshot()
+    if not snap:
+        return []
+    out = []
+    tot = {"calls": 0, "prompt": 0, "cached": 0, "completion": 0}
+    for (tag, model), r in sorted(snap.items(), key=lambda kv: -kv[1]["prompt"]):
+        for k in tot:
+            tot[k] += r[k]
+        hit = (100.0 * r["cached"] / r["prompt"]) if r["prompt"] else 0.0
+        out.append(f"usage {tag} {model}: calls={r['calls']} prompt={r['prompt']} "
+                   f"cached={r['cached']} ({hit:.0f}%) completion={r['completion']}")
+    hit = (100.0 * tot["cached"] / tot["prompt"]) if tot["prompt"] else 0.0
+    out.append(f"usage TOTAL: calls={tot['calls']} prompt={tot['prompt']} "
+               f"cached={tot['cached']} ({hit:.0f}%) completion={tot['completion']}")
+    return out
+
 
 class ModelNotAvailableError(Exception):
     pass
@@ -201,10 +251,11 @@ class LLM:
     def ping(self, model: str) -> tuple[bool, str]:
         try:
             _acquire_rate_token()
-            self.client.chat.completions.create(
+            r = self.client.chat.completions.create(
                 model=model, messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1, temperature=0.0,
             )
+            record_usage("ping", model, getattr(r, "usage", None))
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -229,7 +280,8 @@ class LLM:
             last_err = err
         return False, "", last_err or "all models unavailable"
 
-    def chat(self, system, messages, model, max_tokens=2048, temperature=0.6) -> str:
+    def chat(self, system, messages, model, max_tokens=2048, temperature=0.6,
+             tag="") -> str:
         full = [{"role": "system", "content": system}] + messages
         timeout_attempts = 0
         capacity_attempts = 0
@@ -243,6 +295,8 @@ class LLM:
                     model=model, messages=full,
                     max_tokens=max_tokens, temperature=temperature, **extra,
                 )
+                # Before the blank-content check: an empty 200 still billed.
+                record_usage(tag, model, getattr(r, "usage", None))
                 content = r.choices[0].message.content or ""
                 if content.strip():
                     return content
@@ -604,7 +658,7 @@ def _rank(models: list[str]) -> list[str]:
     return [m for _, _, m in scored]
 
 
-def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
+def _chat(llm, system, history, primary, fallbacks, max_tok, temp, tag="") -> str:
     """Try `primary` first, then each fallback. Falls back on:
       - ModelNotAvailableError (404 / unknown model)
       - persistent throttling (429) or upstream outage (503/502/504) — these
@@ -650,7 +704,7 @@ def _chat(llm, system, history, primary, fallbacks, max_tok, temp) -> str:
                 last = RuntimeError(f"probe failed for {m}")
                 continue
         try:
-            out = llm.chat(system, history, m, max_tok, temp)
+            out = llm.chat(system, history, m, max_tok, temp, tag=tag)
         except ModelNotAvailableError as e:
             # 404 / unknown model: gone from the catalog. Mark it permanently
             # dead so _rank drops it from every future call — never asked again.
@@ -693,7 +747,7 @@ _FIRST_TURN_KICKOFF = "The debate now begins. Present your opening argument dire
 
 
 def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
-                         on_progress=None, on_game_turn=None):
+                         on_progress=None, on_game_turn=None, tag="debate"):
     """Play one Swiss round with cross-game turn-batching.
 
     Instead of N independent per-game turn loops (one slow turn stalls the
@@ -752,7 +806,7 @@ def _play_round_lockstep(llm, config, pairs, topic_obj, strategies, workers,
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futs = {pool.submit(_chat, llm, prompts[(i, side)],
                                 histories[(i, side)], cfg["model"],
-                                fallbacks, max_tok, temp): i
+                                fallbacks, max_tok, temp, tag=tag): i
                     for i in active}
             for fut in as_completed(futs):
                 i = futs[fut]
@@ -872,7 +926,7 @@ def play_game(llm, config, topic_obj, strategy_pro, strategy_con) -> GameResult:
             opp = "Con" if side == "Pro" else "Pro"
             try:
                 raw = _chat(llm, prompts[side], histories[side], cfg["model"],
-                            fallbacks, max_tok, temp)
+                            fallbacks, max_tok, temp, tag="debate")
             except Exception as e:
                 return _mk("void", f"LLM error: {e}")  # infra failure: void, not draw
             visible = strip_thinking(raw, tags)
@@ -927,6 +981,7 @@ def _judge_deliberate(llm, config, judge_model: str, prompt: str,
             "You MUST pick a winner. Respond with exactly PRO or CON on the first line.",
             [{"role": "user", "content": deliberate_prompt}],
             judge_model, max_tokens=judge_max_tokens, temperature=0.3,
+            tag="judge_deliberate",
         )
     except Exception as e:
         log.warning("deliberation %s failed: %s", judge_model, str(e)[:80])
@@ -1002,6 +1057,7 @@ def _judge_one(llm, config, judge_model: str, prompt: str, tags: list) -> tuple[
                 "Respond with exactly PRO or CON on the first line.",
                 [{"role": "user", "content": prompt}],
                 model_to_use, max_tokens=judge_max_tokens, temperature=0.3 + attempt * 0.2,
+                tag="judge_panel",
             )
         except ModelNotAvailableError as e:
             # 404: mark whichever model we actually called permanently dead so it
@@ -1063,6 +1119,7 @@ def _single_judge(llm, config, topic_obj, motion, transcript, duration, tid,
                 "Respond with exactly PRO or CON on the first line.",
                 [{"role": "user", "content": prompt}],
                 primary, fallbacks, max_tok=judge_max_tokens, temp=0.3 + attempt * 0.2,
+                tag="judge_fallback",
             )
         except Exception as e:
             if attempt == 2:
@@ -1370,23 +1427,30 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
     Returns (ch_wins, king_wins, decided).
     """
     workers = max(1, workers)
+    pairs = [(challenger_hk, king_hk), (king_hk, challenger_hk)]  # both seats
+    # A topic is 2 games, so lanes x seats is the games in flight; judging fans
+    # out by panel width on top, as it does in a tournament round. seats caps
+    # at workers so a low concurrency setting is still honored.
+    lanes, seats = max(1, workers // 2), min(2, workers)
     ch_wins = king_wins = 0
-    for topic_obj in topics:
-        # (pro, con) both ways: challenger Pro then challenger Con.
-        pairs = [(challenger_hk, king_hk), (king_hk, challenger_hk)]
-        out = _play_round_lockstep(llm, config, pairs, topic_obj, strategies,
-                                   workers, on_progress=on_progress)
-        for _i, pro, con, gr in out:
-            if gr.winner == "Pro":
-                w = pro
-            elif gr.winner == "Con":
-                w = con
-            else:
-                continue  # draw or void: proves nothing, excluded
-            if w == challenger_hk:
-                ch_wins += 1
-            elif w == king_hk:
-                king_wins += 1
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        for done, out in enumerate(pool.map(lambda t: _play_round_lockstep(
+                llm, config, pairs, t, strategies, seats,
+                on_progress=on_progress, tag="title_fight"), topics), start=1):
+            for _i, pro, con, gr in out:
+                if gr.winner == "Pro":
+                    w = pro
+                elif gr.winner == "Con":
+                    w = con
+                else:
+                    continue  # draw or void: proves nothing, excluded
+                if w == challenger_hk:
+                    ch_wins += 1
+                elif w == king_hk:
+                    king_wins += 1
+            if done % 10 == 0:  # don't run silent
+                log.info(f"title check: {done}/{len(topics)} topics, "
+                         f"challenger {ch_wins}-{king_wins} king")
     decided = ch_wins + king_wins
     log.info(f"title check: challenger {challenger_hk[:8]}… {ch_wins}-{king_wins} "
              f"king {king_hk[:8]}… ({decided}/{2 * len(topics)} decided)")

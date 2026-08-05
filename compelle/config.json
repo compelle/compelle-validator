@@ -29,6 +29,7 @@
     "tournament": {
       "epoch_seconds": 4320,
       "max_concurrent_games": 10,
+      "title_fight_concurrent_games": 20,
       "swiss_rounds": 3
     },
     "elo": {

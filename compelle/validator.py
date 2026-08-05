@@ -15,7 +15,7 @@ import requests
 
 from compelle.engine import (
     LLM, Elo, run_tournament, run_title_fight, resolve_strategy,
-    _GIST_REVISIONED_RE, parse_quota_reset,
+    _GIST_REVISIONED_RE, parse_quota_reset, usage_lines, usage_reset,
 )
 from compelle.eligibility import fetch_records
 from compelle.intent_classifier import classify_records, uncache as intent_uncache
@@ -1256,15 +1256,15 @@ def main():
                 elif n_void:
                     log.warning(f"epoch {epoch}: {n_void}/{len(results)} games voided (infra)")
                 if results:
-                    # Fresh tempo: a crossed challenger runs the title check here
-                    # (may_fight=True), using the same competing set and workers
-                    # as the tournament.
+                    # Fresh tempo: a crossed challenger runs the title check
+                    # here (may_fight=True). A fight runs with no tournament
+                    # alongside it, so it gets its own concurrency setting.
                     real_weights = koth_weights(
                         sub, netuid, elo, crown_eligible, current_tempo,
                         llm=llm, config=cfg, strategies=real_strategies,
                         commitments={hk: _commitment_hash(records[hk].commitment_text)
                                      for hk in real_strategies},
-                        workers=cfg["tournament"].get("max_concurrent_games", 5),
+                        workers=cfg["tournament"].get("title_fight_concurrent_games", 20),
                         on_progress=lambda: last_progress.__setitem__(0, time.time()),
                         may_fight=True)
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
@@ -1335,6 +1335,10 @@ def main():
                                         sw_status == "failed")
         log.info(f"epoch {epoch} done; next in {sleep_secs:.0f}s "
                  f"(cycle elapsed {elapsed:.0f}s)")
+        # Per-epoch token accounting; reset so each epoch's lines stand alone.
+        for line in usage_lines():
+            log.info(line)
+        usage_reset()
         try: sub.close()
         except Exception as e: log.warning(f"subtensor close failed: {e}")
         _heartbeat_sleep(last_progress, sleep_secs)
