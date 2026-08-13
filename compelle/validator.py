@@ -723,7 +723,7 @@ def king_failsafe(records, intent_results, king, resolve_fn) -> bool:
 
 def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
                    margin=KOTH_DEFENSE_MARGIN, hold=KOTH_DETHRONE_EPOCHS,
-                   strategies=None, commitments=None):
+                   strategies=None, commitments=None, consensus_ok=None):
     """Advance dethrone streaks and return (incumbent, challenger|None).
 
     King = highest consensus weight last epoch, read from chain so every
@@ -745,7 +745,14 @@ def koth_contender(sub, netuid, elo, crown_eligible, current_tempo,
     if incumbent is None:
         return None, None
     state = _load_koth()
-    if strategies is not None and incumbent not in strategies:
+    # Follow a consensus king this box cannot field when its chain record is a
+    # real miner and local intent is not BAD (a local resolve/classify failure
+    # must not zero our vtrust); burn/squat artifacts fail is_real and hold.
+    if strategies is not None and incumbent not in strategies and \
+            consensus_ok and incumbent in consensus_ok:
+        log.warning(f"KOTH: consensus king {incumbent[:8]}… not competing locally "
+                    f"(unresolved/unclassified); following the network crown")
+    elif strategies is not None and incumbent not in strategies:
         # Consensus argmax on a non-competing hotkey is an artifact, not a
         # crown move: a stake-majority burn vote parks it on the owner UID, and
         # a deregistered king's recycled UID parks it on the squatter that took
@@ -860,7 +867,7 @@ def _koth_apply_tail(weights: dict, current_tempo: int, competing) -> dict:
 def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
                  config=None, strategies=None, commitments=None, workers=5,
                  on_progress=None, may_fight=True, margin=KOTH_DEFENSE_MARGIN,
-                 hold=KOTH_DETHRONE_EPOCHS):
+                 hold=KOTH_DETHRONE_EPOCHS, consensus_ok=None):
     """Winner-take-all king of the hill. The king takes literally 100% (minus a
     brief 5% transition sliver to the deposed king right after a flip).
 
@@ -883,7 +890,8 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
 
     incumbent, challenger = koth_contender(sub, netuid, elo, crown_eligible,
                                            current_tempo, margin=margin, hold=hold,
-                                           strategies=strategies, commitments=commitments)
+                                           strategies=strategies, commitments=commitments,
+                                           consensus_ok=consensus_ok)
     if incumbent is None:
         return {}
     if challenger is None:
@@ -1195,6 +1203,9 @@ def main():
         n_intent_locked = sum(1 for r in records.values() if r.is_real and r.intent_verdict == "BAD")
         log.info(f"miners: {n_real} real, {n_eps} epsilon, {n_zero} ineligible, {n_intent_locked} intent-locked")
 
+        consensus_ok = {hk for hk, r in records.items()
+                        if r.is_real and r.intent_verdict != "BAD"}
+
         # Idempotency: skip the tournament if we already completed THIS tempo.
         # Prevents double-applying Elo if the validator restarts mid-tempo.
         # Topic-index uses the same tempo computation as engine.run_tournament.
@@ -1213,7 +1224,7 @@ def main():
                                         strategies=real_strategies,
                                         commitments={hk: _commitment_hash(records[hk].commitment_text)
                                                      for hk in real_strategies},
-                                        may_fight=False)
+                                        may_fight=False, consensus_ok=consensus_ok)
         elif n_real >= 2:
             # Preflight the whole failover chain, not just the primary: a 429 on
             # the primary alone must not skip the epoch when a fallback is
@@ -1266,7 +1277,7 @@ def main():
                                      for hk in real_strategies},
                         workers=cfg["tournament"].get("title_fight_concurrent_games", 20),
                         on_progress=lambda: last_progress.__setitem__(0, time.time()),
-                        may_fight=True)
+                        may_fight=True, consensus_ok=consensus_ok)
                     # Mark tempo BEFORE saving Elo: a crash between the two writes
                     # is preferable in this order — on restart we'd skip the
                     # tournament (stale Elo) instead of double-counting matches.
