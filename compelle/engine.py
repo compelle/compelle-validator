@@ -1,5 +1,6 @@
 import re
 import os
+import stat
 import json
 import math
 import time
@@ -352,6 +353,12 @@ _GIST_REVISIONED_RE = re.compile(r"^gist:([0-9a-f]{20,40})/([0-9a-f]{40})$")
 # fetches we've already done. Revisions are immutable by SHA-1, so a hit is
 # safe forever; we never invalidate.
 _GIST_CACHE_PATH = os.environ.get("COMPELLE_GIST_CACHE") or "data/gist_cache.json"
+# Second copy at a fixed absolute path inside the service's writable state
+# dir, so a changed working directory or a lost data dir does not lose every
+# resolved text. Empty disables.
+_GIST_CACHE_BACKUP = (os.environ.get("COMPELLE_GIST_CACHE_BACKUP")
+                      if "COMPELLE_GIST_CACHE_BACKUP" in os.environ
+                      else "/var/lib/compelle/backup/gist_cache.json")
 _gist_cache: dict[tuple[str, str], str] = {}
 _gist_cache_loaded = False
 
@@ -361,32 +368,43 @@ def _load_gist_cache() -> None:
     if _gist_cache_loaded:
         return
     _gist_cache_loaded = True
-    try:
-        with open(_GIST_CACHE_PATH) as f:
-            data = json.load(f)
+    for path in (_GIST_CACHE_PATH, _GIST_CACHE_BACKUP):
+        if not path:
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            log.warning(f"gist cache load failed at {path} ({e})")
+            continue
+        if not isinstance(data, dict):
+            log.warning(f"gist cache at {path}: not a dict, ignored")
+            continue
         for k, v in data.items():
             if "/" in k and isinstance(v, str):
                 gid, rev = k.split("/", 1)
-                _gist_cache[(gid, rev)] = v
-        log.info(f"loaded gist cache: {len(_gist_cache)} entries from {_GIST_CACHE_PATH}")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        log.warning(f"gist cache load failed ({e}); starting empty")
+                _gist_cache.setdefault((gid, rev), v)
+    if _gist_cache:
+        log.info(f"loaded gist cache: {len(_gist_cache)} entries")
 
 
 def _save_gist_cache() -> None:
-    try:
-        d = os.path.dirname(_GIST_CACHE_PATH)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        tmp = _GIST_CACHE_PATH + ".tmp"
-        out = {f"{gid}/{rev}": v for (gid, rev), v in _gist_cache.items()}
-        with open(tmp, "w") as f:
-            json.dump(out, f)
-        os.replace(tmp, _GIST_CACHE_PATH)
-    except Exception as e:
-        log.warning(f"gist cache save failed: {e}")
+    out = {f"{gid}/{rev}": v for (gid, rev), v in _gist_cache.items()}
+    for path in (_GIST_CACHE_PATH, _GIST_CACHE_BACKUP):
+        if not path:
+            continue
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(out, f)
+            os.replace(tmp, path)
+        except Exception as e:
+            log.warning(f"gist cache save failed at {path}: {e}")
 
 
 def resolve_strategy(commitment: str) -> str:
@@ -438,7 +456,167 @@ def resolve_strategy(commitment: str) -> str:
         return content
     except Exception as e:
         log.error(f"gist {commitment} fetch failed: {e}")
+        if commitment not in _recover_allowed:
+            return ""
+        try:
+            return _recover(gist_id, revision)
+        except Exception as e2:
+            log.error(f"gist {commitment} recovery failed: {e2}")
+            return ""
+
+
+# Backup recovery is reserved for the reigning king's commitment; any other
+# miner with a dead gist can simply re-register.
+_recover_allowed: set = set()
+_recover_missed: set = set()
+
+
+def allow_recovery(commitments) -> None:
+    _recover_allowed.clear()
+    _recover_allowed.update(c for c in commitments if c)
+
+
+def _recover(gist_id: str, revision: str) -> str:
+    """Backup restore after cache and GitHub both failed: this box's own
+    provenance records first, then prior installs' files found on disk.
+    A miss is remembered so the scans run once per ref per process."""
+    key = (gist_id, revision)
+    if key in _recover_missed:
         return ""
+    text = (_recover_from_provenance(gist_id, revision)
+            or _recover_from_disk(gist_id, revision))
+    if not text:
+        _recover_missed.add(key)
+    return text
+
+
+def _recovered_ok(text) -> bool:
+    """Recovered text must pass the same checks as a GitHub response."""
+    return (isinstance(text, str) and bool(text)
+            and len(text.encode("utf-8")) <= MAX_STRATEGY_BYTES
+            and plain_text_ok(text))
+
+
+def _provenance_paths() -> tuple:
+    from compelle import provenance
+    base = str(provenance._path())
+    return (base, base + ".1")
+
+
+def _provenance_match(path: str, ref: str) -> str:
+    """Verified strategy text for ref from one provenance file, or ""."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if ref not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                text = obj.get("strategy")
+                if obj.get("source") != ref or not _recovered_ok(text):
+                    continue
+                sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+                if sha == obj.get("strategy_sha256"):
+                    return text
+    except Exception as e:
+        log.warning(f"provenance scan failed at {path}: {e}")
+    return ""
+
+
+def _recover_from_provenance(gist_id: str, revision: str) -> str:
+    """The ref pins an immutable revision, so any hotkey's recorded
+    resolution of it is the same text; the record's content hash is
+    checked before use."""
+    ref = f"gist:{gist_id}/{revision}"
+    for path in _provenance_paths():
+        text = _provenance_match(path, ref)
+        if text:
+            log.warning(f"gist {ref} restored from provenance records")
+            _gist_cache[(gist_id, revision)] = text
+            _save_gist_cache()
+            return text
+    return ""
+
+
+# One filesystem walk per process finds this validator's own gist caches and
+# provenance records left behind by prior installs. The walk runs in a helper
+# thread with a deadline so a wedged mount cannot stall the epoch, and only
+# regular files owned by this user or root are trusted.
+_SWEEP_ROOTS = ("/opt", "/srv", "/root", "/home", "/var/lib", "/data", "/app")
+_SWEEP_DEADLINE_S = 120
+_MAX_CACHE_FILE_BYTES = 32 * 1024 * 1024
+_sweep_hits: list = []
+_sweep_thread = None
+_disk_sweep_files: list | None = None
+
+
+def _sweep_worker() -> None:
+    global _disk_sweep_files
+    names = {"gist_cache.json", "provenance.jsonl", "provenance.jsonl.1"}
+    live = {os.path.abspath(p) for p in
+            (_GIST_CACHE_PATH, _GIST_CACHE_BACKUP) + _provenance_paths() if p}
+    for top in _SWEEP_ROOTS:
+        for root, dirs, files in os.walk(top, followlinks=False):
+            for n in names.intersection(files):
+                p = os.path.join(root, n)
+                if os.path.abspath(p) not in live:
+                    _sweep_hits.append(p)
+    _disk_sweep_files = list(_sweep_hits)
+    log.info(f"disk sweep: {len(_disk_sweep_files)} candidate recovery files")
+
+
+def _disk_sweep() -> list:
+    global _sweep_thread
+    if _disk_sweep_files is not None:
+        return _disk_sweep_files
+    if _sweep_thread is None:
+        _sweep_thread = threading.Thread(target=_sweep_worker, daemon=True)
+        _sweep_thread.start()
+    _sweep_thread.join(_SWEEP_DEADLINE_S)
+    if _disk_sweep_files is not None:
+        return _disk_sweep_files
+    log.warning(f"disk sweep still running; using {len(_sweep_hits)} partial results")
+    return list(_sweep_hits)
+
+
+def _candidate_ok(path: str, max_bytes=None) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode)
+            and st.st_uid in (os.getuid(), 0)
+            and (max_bytes is None or st.st_size <= max_bytes))
+
+
+def _recover_from_disk(gist_id: str, revision: str) -> str:
+    ref = f"gist:{gist_id}/{revision}"
+    for path in _disk_sweep():
+        if os.path.basename(path) == "gist_cache.json":
+            if not _candidate_ok(path, _MAX_CACHE_FILE_BYTES):
+                continue
+            try:
+                with open(path) as f:
+                    text = json.load(f).get(f"{gist_id}/{revision}")
+            except Exception:
+                continue
+            if not _recovered_ok(text):
+                continue
+        else:
+            if not _candidate_ok(path):
+                continue
+            text = _provenance_match(path, ref)
+            if not text:
+                continue
+        log.warning(f"gist {ref} restored from {path}")
+        _gist_cache[(gist_id, revision)] = text
+        _save_gist_cache()
+        return text
+    return ""
 
 
 @dataclass

@@ -15,7 +15,8 @@ import requests
 
 from compelle.engine import (
     LLM, Elo, run_tournament, run_title_fight, resolve_strategy,
-    _GIST_REVISIONED_RE, parse_quota_reset, usage_lines, usage_reset,
+    allow_recovery, _GIST_REVISIONED_RE, parse_quota_reset, usage_lines,
+    usage_reset,
 )
 from compelle.eligibility import fetch_records
 from compelle.intent_classifier import classify_records, uncache as intent_uncache
@@ -1149,6 +1150,11 @@ def main():
                  f"model={cfg['game']['model']}, gist_revision={cached_revision[:8]}, "
                  f"models_gist={cached_model_revision[:8]})")
 
+        # Backup recovery is reserved for the reigning king's commitment.
+        king_hk = _incumbent_king(sub, netuid)
+        allow_recovery([records[king_hk].commitment_text]
+                       if king_hk in records else [])
+
         # Commit-time intent classifier — pluggable, feature-flagged via cfg.
         intent_cfg = cfg.get("intent_classifier") or {}
         if intent_cfg.get("enabled", True):
@@ -1167,7 +1173,7 @@ def main():
                 )
                 for hk, res in intent_results.items():
                     records[hk].intent_verdict = res.verdict
-                king_failsafe(records, intent_results, _incumbent_king(sub, netuid),
+                king_failsafe(records, intent_results, king_hk,
                               resolve_strategy)
                 n_bad = sum(1 for r in records.values() if r.intent_verdict == "BAD")
                 n_good = sum(1 for r in records.values() if r.intent_verdict == "GOOD")
