@@ -940,6 +940,16 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
     return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
 
 
+def payable_weights(real_weights: dict, real_strategies, consensus_ok) -> dict:
+    """Restrict weights to miners whose current commitment resolves, so stale
+    Elo cannot keep paying a rejected commitment. The consensus king is
+    exempt: the follow-the-network-crown path can emit a king this box cannot
+    resolve, and dropping it here would re-zero the epoch the valve saved.
+    """
+    return {hk: w for hk, w in real_weights.items()
+            if hk in real_strategies or hk in consensus_ok}
+
+
 def get_last_tempo() -> int:
     """Return the highest tempo_index already processed, or -1 if never."""
     try:
@@ -1289,14 +1299,7 @@ def main():
                                         for hk in elo.ratings if hk in records}
                     save_elo(elo)
 
-        # Drop hotkeys whose CURRENT commitment doesn't resolve, even if they
-        # carry stale Elo from earlier epochs. real_strategies (built above) is
-        # already filtered to non-empty resolutions, so it's the canonical set
-        # of "currently usable" miners. Without this guard, a miner that earned
-        # Elo under a previous (looser) regex keeps getting weight after their
-        # commitment is rejected.
-        real_weights = {hk: w for hk, w in real_weights.items()
-                        if hk in real_strategies}
+        real_weights = payable_weights(real_weights, real_strategies, consensus_ok)
         weights = dict(real_weights)  # KOTH: king takes ~100% (5% transition sliver to a just-deposed king); no broad epsilon carve-out
         if weights:
             uids = [records[hk].uid for hk in weights]
