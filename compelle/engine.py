@@ -1588,11 +1588,12 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
 
     Every topic is played both ways (each fighter takes Pro on it once and Con
     once), so the two sides get an equal number of Pro and Con seats and the
-    seat advantage cancels. Draws and infra voids are not counted either way.
-    Elo is not read or updated here. The caller applies the win bar: the win
-    count must be significant under a fair coin, so an evenly-matched challenger
-    (50/50 vs the king) almost never clears it on variance; the new king must
-    clearly beat the old one.
+    seat advantage cancels. Draws and infra voids are not counted either way;
+    an infra-voided seat is replayed once before it is dropped. Elo is not read
+    or updated here. The caller applies the win bar: the win count must be
+    significant under a fair coin, so an evenly-matched challenger (50/50 vs
+    the king) almost never clears it on variance; the new king must clearly beat
+    the old one.
 
     Why a match and not Elo alone: the crown is winner-take-all, so it should
     turn on beating the sitting king head-to-head, the most direct merit test
@@ -1611,24 +1612,51 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
     # at workers so a low concurrency setting is still honored.
     lanes, seats = max(1, workers // 2), min(2, workers)
     ch_wins = king_wins = 0
+    voided = []
+
+    def tally(pro, con, result):
+        nonlocal ch_wins, king_wins
+        if result.winner == "Pro":
+            winner = pro
+        elif result.winner == "Con":
+            winner = con
+        else:
+            return False
+        if winner == challenger_hk:
+            ch_wins += 1
+            return True
+        elif winner == king_hk:
+            king_wins += 1
+            return True
+        return False
+
     with ThreadPoolExecutor(max_workers=lanes) as pool:
-        for done, out in enumerate(pool.map(lambda t: _play_round_lockstep(
-                llm, config, pairs, t, strategies, seats,
-                on_progress=on_progress, tag="title_fight"), topics), start=1):
+        rounds = pool.map(lambda t: _play_round_lockstep(
+            llm, config, pairs, t, strategies, seats,
+            on_progress=on_progress, tag="title_fight"), topics)
+        for done, (topic, out) in enumerate(zip(topics, rounds), start=1):
             for _i, pro, con, gr in out:
-                if gr.winner == "Pro":
-                    w = pro
-                elif gr.winner == "Con":
-                    w = con
-                else:
-                    continue  # draw or void: proves nothing, excluded
-                if w == challenger_hk:
-                    ch_wins += 1
-                elif w == king_hk:
-                    king_wins += 1
+                if not tally(pro, con, gr) and gr.winner == "void":
+                    voided.append((topic, (pro, con)))
             if done % 10 == 0:  # don't run silent
                 log.info(f"title check: {done}/{len(topics)} topics, "
                          f"challenger {ch_wins}-{king_wins} king")
+
+        # A void means the provider failed, not that the matchup was undecided
+        # on merit. Retry only that exact topic and seat, once. Completed games
+        # cannot be counted twice, draws remain final, and a sustained outage
+        # still falls through to the caller's minimum-decided safety floor.
+        if voided:
+            log.info(f"title check: replaying {len(voided)} infra-voided game(s)")
+            replays = pool.map(lambda item: _play_round_lockstep(
+                llm, config, [item[1]], item[0], strategies, seats,
+                on_progress=on_progress, tag="title_fight"), voided)
+            recovered = 0
+            for out in replays:
+                for _i, pro, con, gr in out:
+                    if tally(pro, con, gr):
+                        recovered += 1
+            log.info(f"title check: recovered {recovered}/{len(voided)} voided game(s)")
     decided = ch_wins + king_wins
     log.info(f"title check: challenger {challenger_hk[:8]}… {ch_wins}-{king_wins} "
              f"king {king_hk[:8]}… ({decided}/{2 * len(topics)} decided)")
