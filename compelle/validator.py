@@ -656,8 +656,9 @@ KOTH_TAIL_EPOCHS = 5      # epochs a deposed king keeps a 5% sliver after a crow
 KOTH_VACANCY_EPOCHS = 40  # epochs a deregistered king's crown is held open for its
                           # return before the top-rated eligible competitor is seated
 KOTH_FIGHT_TOPICS = 100   # most-recent unique motions the fight is played on (x2 seats = 200 games)
-KOTH_FIGHT_ALPHA = 0.01   # crown only if the win count is significant at this level under a fair coin
-KOTH_FIGHT_MIN_DECIDED = 80  # power floor: fewer decided games than this -> inconclusive, king holds
+KOTH_FIGHT_MIN_PAIRS = 40  # coverage floor: fewer complete topic pairs -> inconclusive
+KOTH_FIGHT_MIN_NET_WINS = 20  # fixed at 10% of the planned 200 games, even at lower coverage
+KOTH_FIGHT_ALPHA = 0.01    # one-sided exact paired sign-flip threshold
 
 
 def _majority_burn_uid(sub, netuid):
@@ -682,20 +683,28 @@ def _majority_burn_uid(sub, netuid):
         return None
 
 
-def _binom_crit(n: int, alpha: float = KOTH_FIGHT_ALPHA) -> int:
-    """Smallest win count W in n decided games whose one-sided binomial tail
-    P(X >= W) under a fair coin is <= alpha. At this bar an evenly-matched
-    challenger (each game a 50/50 toss) clears it at most `alpha` of the time,
-    independent of how many games this validator ran. A fixed win *fraction*
-    can't hold that constant: its false-positive rate drifts with n. The bar
-    filters variance, not skill: a clearly stronger challenger clears it easily;
-    only a coin-flip-equal one is held back."""
-    from math import comb
-    for w in range(n + 1):
-        tail = sum(comb(n, k) for k in range(w, n + 1)) / (2 ** n)
-        if tail <= alpha:
-            return w
-    return n + 1
+def _paired_signflip_p(pair_diffs) -> float:
+    """Exact one-sided p-value for complete topic-pair differentials.
+
+    Under an evenly matched null, swapping the fighter labels flips each
+    topic's differential without changing its magnitude. Enumerating those
+    independent signs preserves topic difficulty and the Pro/Con seat pairing
+    instead of pretending the two games are unrelated coin flips. Zero-margin
+    pairs carry no directional evidence and cancel from numerator/denominator.
+    """
+    margins = [abs(diff) for diff in pair_diffs if diff]
+    if not margins:
+        return 1.0
+    totals = {0: 1}
+    for margin in margins:
+        next_totals = {}
+        for total, ways in totals.items():
+            next_totals[total + margin] = next_totals.get(total + margin, 0) + ways
+            next_totals[total - margin] = next_totals.get(total - margin, 0) + ways
+        totals = next_totals
+    observed = sum(pair_diffs)
+    tail = sum(ways for total, ways in totals.items() if total >= observed)
+    return tail / (1 << len(margins))
 
 
 def king_failsafe(records, intent_results, king, resolve_fn) -> bool:
@@ -908,33 +917,52 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
             return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
         # Play on the most-recent KOTH_FIGHT_TOPICS unique motions (x2 seats),
         # not the ~10 live rotation topics, for statistical power over a broad
-        # topic set. Fail-closed to the live set; the >=KOTH_FIGHT_MIN_DECIDED
-        # floor then holds the king.
-        topics = _recent_unique_motions((config or {}).get("config_gist_id", ""),
-                                        (config or {}).get("config_gist_owner", ""),
-                                        KOTH_FIGHT_TOPICS) or ((config or {}).get("topics") or [])
-        games = 2 * len(topics)
-        ch_wins, king_wins, decided = run_title_fight(
+        # topic set. Fail closed when the available pool cannot possibly clear
+        # the complete-pair coverage floor.
+        topic_pool = _recent_unique_motions((config or {}).get("config_gist_id", ""),
+                                            (config or {}).get("config_gist_owner", ""),
+                                            KOTH_FIGHT_TOPICS) or \
+            ((config or {}).get("topics") or [])
+        topics, seen_motions = [], set()
+        for topic in topic_pool:
+            motion = (topic.get("motion") or "").strip() if isinstance(topic, dict) else ""
+            if not motion or motion in seen_motions:
+                continue
+            seen_motions.add(motion)
+            topics.append(topic)
+            if len(topics) == KOTH_FIGHT_TOPICS:
+                break
+        if len(topics) < KOTH_FIGHT_MIN_PAIRS:
+            log.warning(f"KOTH title check skipped: only {len(topics)} topics available, "
+                        f"need {KOTH_FIGHT_MIN_PAIRS}; king holds, challenger keeps its streak")
+            return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
+        fight = run_title_fight(
             llm, config, incumbent, challenger, strategies, topics, workers,
             on_progress=on_progress)
-        if decided < KOTH_FIGHT_MIN_DECIDED:  # too few decided (short pool or outage)
-            log.warning(f"KOTH title check inconclusive ({decided}/{games} decided, "
-                        f"floor {KOTH_FIGHT_MIN_DECIDED}); king holds, challenger keeps its streak")
+        complete_pairs = len(fight.pair_diffs)
+        if complete_pairs < KOTH_FIGHT_MIN_PAIRS:
+            log.warning(f"KOTH title check inconclusive ({complete_pairs}/{len(topics)} "
+                        f"complete pairs, floor {KOTH_FIGHT_MIN_PAIRS}); king holds, "
+                        f"challenger keeps its streak")
             return _koth_apply_tail({incumbent: 1.0}, current_tempo, strategies)
-        # Significance bar: crown only if the win count is unlikely for an
-        # evenly-matched challenger (each game a 50/50 toss) at KOTH_FIGHT_ALPHA.
-        # The bar scales with the decided count, so the false-positive rate stays
-        # ~alpha no matter how many games this validator ran.
-        need = _binom_crit(decided, KOTH_FIGHT_ALPHA)
-        won = ch_wins >= need
-        log.info(f"KOTH title check: challenger {ch_wins}/{decided} decided, "
-                 f"need {need} (alpha {KOTH_FIGHT_ALPHA}) -> {'CROWN' if won else 'hold'}")
+        net_wins = sum(fight.pair_diffs)
+        p_value = _paired_signflip_p(fight.pair_diffs)
+        won = net_wins >= KOTH_FIGHT_MIN_NET_WINS and p_value <= KOTH_FIGHT_ALPHA
+        log.info(f"KOTH title check: challenger {fight.challenger_wins}-"
+                 f"{fight.king_wins} king across {complete_pairs} complete pairs, "
+                 f"net {net_wins} (need {KOTH_FIGHT_MIN_NET_WINS}), "
+                 f"paired p={p_value:.6g} (alpha {KOTH_FIGHT_ALPHA}) -> "
+                 f"{'CROWN' if won else 'hold'}")
         _koth_record_fight(current_tempo, challenger, incumbent, won)
         if won:
-            log.info(f"KOTH: {challenger} beat king {incumbent} {ch_wins}-{king_wins} in the title check; crown transfers")
+            log.info(f"KOTH: {challenger} beat king {incumbent} "
+                     f"{fight.challenger_wins}-{fight.king_wins} in the title check; "
+                     f"crown transfers")
         else:
             _koth_reset_streak(challenger)
-            log.info(f"KOTH: challenger {challenger[:8]}… lost the title check {ch_wins}-{king_wins}; king {incumbent[:8]}… holds, streak reset")
+            log.info(f"KOTH: challenger {challenger[:8]}… lost the title check "
+                     f"{fight.challenger_wins}-{fight.king_wins}; king "
+                     f"{incumbent[:8]}… holds, streak reset")
 
     if won:
         return _koth_apply_tail({challenger: 1.0}, current_tempo, strategies)

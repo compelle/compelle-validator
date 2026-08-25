@@ -636,6 +636,14 @@ class GameResult:
     judge_panel_votes: list = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class TitleFightResult:
+    """Scoring data from complete, seat-balanced topic pairs only."""
+    pair_diffs: tuple[int, ...]  # challenger wins minus king wins for each pair
+    challenger_wins: int
+    king_wins: int
+
+
 # --- Per-model circuit breaker -----------------------------------------------
 # A model is preferred whenever it is healthy, but under a Chutes capacity crunch
 # a model can straddle our 90s read timeout: most calls still complete, just
@@ -1588,12 +1596,10 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
 
     Every topic is played both ways (each fighter takes Pro on it once and Con
     once), so the two sides get an equal number of Pro and Con seats and the
-    seat advantage cancels. Draws and infra voids are not counted either way;
-    an infra-voided seat is replayed once before it is dropped. Elo is not read
-    or updated here. The caller applies the win bar: the win count must be
-    significant under a fair coin, so an evenly-matched challenger (50/50 vs
-    the king) almost never clears it on variance; the new king must clearly beat
-    the old one.
+    seat advantage cancels. An infra-voided seat is replayed once. If it still
+    voids, the whole topic pair is excluded so a lone result cannot reintroduce
+    seat bias. Draws are valid, neutral outcomes. Elo is not read or updated
+    here; the caller applies the coverage, margin, and paired significance bars.
 
     Why a match and not Elo alone: the crown is winner-take-all, so it should
     turn on beating the sitting king head-to-head, the most direct merit test
@@ -1603,7 +1609,7 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
     than an Elo number is also the groundwork a future private-strategy
     commitment scheme would build on.
 
-    Returns (ch_wins, king_wins, decided).
+    Returns complete-pair differentials plus the wins scored within those pairs.
     """
     workers = max(1, workers)
     pairs = [(challenger_hk, king_hk), (king_hk, challenger_hk)]  # both seats
@@ -1611,11 +1617,12 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
     # out by panel width on top, as it does in a tournament round. seats caps
     # at workers so a low concurrency setting is still honored.
     lanes, seats = max(1, workers // 2), min(2, workers)
-    ch_wins = king_wins = 0
+    raw_ch_wins = raw_king_wins = 0
+    topic_results = []
     voided = []
 
     def tally(pro, con, result):
-        nonlocal ch_wins, king_wins
+        nonlocal raw_ch_wins, raw_king_wins
         if result.winner == "Pro":
             winner = pro
         elif result.winner == "Con":
@@ -1623,10 +1630,10 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
         else:
             return False
         if winner == challenger_hk:
-            ch_wins += 1
+            raw_ch_wins += 1
             return True
         elif winner == king_hk:
-            king_wins += 1
+            raw_king_wins += 1
             return True
         return False
 
@@ -1634,33 +1641,69 @@ def run_title_fight(llm, config, king_hk, challenger_hk, strategies, topics,
         rounds = pool.map(lambda t: _play_round_lockstep(
             llm, config, pairs, t, strategies, seats,
             on_progress=on_progress, tag="title_fight"), topics)
-        for done, (topic, out) in enumerate(zip(topics, rounds), start=1):
+        for topic_index, (topic, out) in enumerate(zip(topics, rounds)):
+            final = []
             for _i, pro, con, gr in out:
+                seat_index = len(final)
+                final.append((pro, con, gr.winner))
                 if not tally(pro, con, gr) and gr.winner == "void":
-                    voided.append((topic, (pro, con)))
+                    voided.append((topic_index, seat_index, topic, (pro, con)))
+            topic_results.append(final)
+            done = topic_index + 1
             if done % 10 == 0:  # don't run silent
                 log.info(f"title check: {done}/{len(topics)} topics, "
-                         f"challenger {ch_wins}-{king_wins} king")
+                         f"challenger {raw_ch_wins}-{raw_king_wins} king")
 
         # A void means the provider failed, not that the matchup was undecided
         # on merit. Retry only that exact topic and seat, once. Completed games
         # cannot be counted twice, draws remain final, and a sustained outage
-        # still falls through to the caller's minimum-decided safety floor.
+        # still falls through to the caller's complete-pair coverage floor.
         if voided:
             log.info(f"title check: replaying {len(voided)} infra-voided game(s)")
             replays = pool.map(lambda item: _play_round_lockstep(
-                llm, config, [item[1]], item[0], strategies, seats,
+                llm, config, [item[3]], item[2], strategies, seats,
                 on_progress=on_progress, tag="title_fight"), voided)
             recovered = 0
-            for out in replays:
+            for (topic_index, seat_index, _topic, _pair), out in zip(voided, replays):
                 for _i, pro, con, gr in out:
-                    if tally(pro, con, gr):
+                    topic_results[topic_index][seat_index] = (pro, con, gr.winner)
+                    tally(pro, con, gr)
+                    if gr.winner in ("Pro", "Con", "draw"):
                         recovered += 1
             log.info(f"title check: recovered {recovered}/{len(voided)} voided game(s)")
-    decided = ch_wins + king_wins
-    log.info(f"title check: challenger {challenger_hk[:8]}… {ch_wins}-{king_wins} "
-             f"king {king_hk[:8]}… ({decided}/{2 * len(topics)} decided)")
-    return ch_wins, king_wins, decided
+
+    pair_diffs = []
+    ch_wins = king_wins = draws = 0
+    for out in topic_results:
+        outcomes = []
+        for pro, con, result in out:
+            if result == "draw":
+                outcomes.append(0)
+                continue
+            if result == "Pro":
+                winner = pro
+            elif result == "Con":
+                winner = con
+            else:
+                outcomes.append(None)
+                continue
+            outcomes.append(1 if winner == challenger_hk else -1)
+        if len(outcomes) != 2 or None in outcomes:
+            continue
+        pair_diffs.append(sum(outcomes))
+        ch_wins += outcomes.count(1)
+        king_wins += outcomes.count(-1)
+        draws += outcomes.count(0)
+
+    raw_decided = raw_ch_wins + raw_king_wins
+    excluded_pairs = len(topics) - len(pair_diffs)
+    log.info(f"title check: challenger {challenger_hk[:8]}… "
+             f"{raw_ch_wins}-{raw_king_wins} king {king_hk[:8]}… "
+             f"({raw_decided}/{2 * len(topics)} decided)")
+    log.info(f"title check: scored {len(pair_diffs)}/{len(topics)} complete pairs, "
+             f"excluded {excluded_pairs}, challenger {ch_wins}-{king_wins} king, "
+             f"{draws} draws")
+    return TitleFightResult(tuple(pair_diffs), ch_wins, king_wins)
 
 
 def run_tournament(llm, config, strategies, epoch_start_block: int, elo=None,
