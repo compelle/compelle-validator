@@ -308,7 +308,7 @@ def set_weights(sub, wallet, netuid, uids, vals) -> bool:
 
 
 def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, elo,
-                set_weights_status, real_strategies=None):
+                set_weights_status, current_tempo=None, real_strategies=None):
     os.makedirs(DATA_DIR, exist_ok=True)
     from compelle import FULL_VERSION
     # All games in a tournament share one topic now, so surface it at the top.
@@ -351,6 +351,11 @@ def write_epoch(epoch, epoch_block, topics_revision, records, weights, results, 
         },
         "results": [{"pro": pro, "con": con, **asdict(r)} for pro, con, r in results],
     }
+    fight = _load_koth().get("fight") or {}
+    if fight.get("tempo") == current_tempo:
+        payload["title_fight"] = fight
+    else:
+        payload["title_fight"] = None
     path = f"{DATA_DIR}/epoch_{epoch_block:010d}.json.gz"
     with gzip.open(path, "wt", encoding="utf-8") as f:
         json.dump(payload, f)
@@ -848,10 +853,15 @@ def _koth_cached_fight(current_tempo: int, challenger: str):
 
 
 def _koth_record_fight(current_tempo: int, challenger: str, incumbent: str,
-                       won: bool) -> None:
+                       won: bool, summary: dict | None = None) -> None:
     state = _load_koth()
-    state["fight"] = {"tempo": current_tempo, "challenger": challenger,
-                      "won": bool(won)}
+    state["fight"] = {
+        "tempo": current_tempo,
+        "challenger": challenger,
+        "incumbent": incumbent,
+        "won": bool(won),
+        **(summary or {}),
+    }
     if won:  # crown transfer: start the transition tail
         state["reign"] = {"king": challenger, "prev": incumbent,
                           "since": current_tempo, "won": True}
@@ -948,12 +958,23 @@ def koth_weights(sub, netuid, elo, crown_eligible, current_tempo, llm=None,
         net_wins = sum(fight.pair_diffs)
         p_value = _paired_signflip_p(fight.pair_diffs)
         won = net_wins >= KOTH_FIGHT_MIN_NET_WINS and p_value <= KOTH_FIGHT_ALPHA
+        fight_summary = {
+            "complete_pairs": complete_pairs,
+            "pair_diffs": list(fight.pair_diffs),
+            "challenger_wins": fight.challenger_wins,
+            "king_wins": fight.king_wins,
+            "net_wins": net_wins,
+            "p_value": p_value,
+            "min_pairs": KOTH_FIGHT_MIN_PAIRS,
+            "min_net_wins": KOTH_FIGHT_MIN_NET_WINS,
+            "alpha": KOTH_FIGHT_ALPHA,
+        }
         log.info(f"KOTH title check: challenger {fight.challenger_wins}-"
                  f"{fight.king_wins} king across {complete_pairs} complete pairs, "
                  f"net {net_wins} (need {KOTH_FIGHT_MIN_NET_WINS}), "
                  f"paired p={p_value:.6g} (alpha {KOTH_FIGHT_ALPHA}) -> "
                  f"{'CROWN' if won else 'hold'}")
-        _koth_record_fight(current_tempo, challenger, incumbent, won)
+        _koth_record_fight(current_tempo, challenger, incumbent, won, fight_summary)
         if won:
             log.info(f"KOTH: {challenger} beat king {incumbent} "
                      f"{fight.challenger_wins}-{fight.king_wins} in the title check; "
@@ -1366,7 +1387,8 @@ def main():
         last_sw_ts = time.time()
 
         write_epoch(epoch, epoch_start_block, cached_revision, records, weights, results, elo,
-                    sw_status, real_strategies=real_strategies)
+                    sw_status, current_tempo=current_tempo,
+                    real_strategies=real_strategies)
         prune_epochs(keep_epochs)
         push_pending(cfg["push_url"], wallet)
         write_health(epoch, last_progress[0], epoch_start_block,
